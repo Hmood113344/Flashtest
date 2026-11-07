@@ -60,6 +60,7 @@ const AccountSchema = new mongoose.Schema({
     kind: { type: String, enum: ["citizen", "military"], required: true },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true }, // وهمي
     passwordHash: String,
+    tmpPass: { type: String, default: null },        // مشفّرة (يكتبها البوت)، تنحذف بعد القبول/الرفض
     fullName: String,
     age: Number,
     answers: [{ q: String, a: String, _id: false }],
@@ -288,7 +289,8 @@ async function approveAccount(uid, by) {
     a.status = "approved"; a.reviewedBy = by.id; a.reviewedByTag = by.tag; a.reviewedAt = new Date();
     await a.save();
     await giveRole(uid, a.kind === "military" ? CONFIG.MILITARY_ROLE_ID : CONFIG.CITIZEN_ROLE_ID);
-    await dm(uid, "✅ **تم قبول تقديمك في فلاش (" + kindLabel(a.kind) + ")**\n" + (a.kind === "citizen" ? "🪪 رقم هويتك المدنية: **" + a.civilId + "**\n" : "🎖️ رتبتك: **" + a.rank + "**\n") + "ادخل الموقع بالبريد وكلمة المرور اللي سجلتها" + (CONFIG.SITE_URL ? ":\n" + CONFIG.SITE_URL : "."));
+    // رسالة القبول (إمبد فيه الإيميل وكلمة المرور) يبنيها البوت
+    await BotJob.create({ type: "welcome", uid }).catch(() => {});
     await logEvent({ action: "قبول تقديم", actor: by.id, actorName: by.tag, target: uid, details: a.kind });
     return { ok: true, account: a };
 }
@@ -296,7 +298,7 @@ async function rejectAccount(uid, by, reason) {
     const a = await Account.findOne({ uid });
     if (!a) return { ok: false, msg: "الطلب غير موجود" };
     if (a.status !== "pending") return { ok: false, msg: "الطلب تمت مراجعته من قبل" };
-    a.status = "rejected"; a.rejectReason = clip(reason, 500); a.reviewedBy = by.id; a.reviewedByTag = by.tag; a.reviewedAt = new Date();
+    a.status = "rejected"; a.rejectReason = clip(reason, 500); a.reviewedBy = by.id; a.reviewedByTag = by.tag; a.reviewedAt = new Date(); a.tmpPass = null;
     await a.save();
     await dm(uid, "❌ **تم رفض تقديمك في فلاش (" + kindLabel(a.kind) + ")**\nالسبب: " + (a.rejectReason || "غير محدد") + "\nتقدر تقدّم من جديد بعد ما تتواصل مع الإدارة.");
     await logEvent({ action: "رفض تقديم", actor: by.id, actorName: by.tag, target: uid, details: a.rejectReason });
@@ -620,7 +622,7 @@ app.get("/api/mil/my", loadAuth, needMilitary, wrap(async (req, res) => {
 // ── الإدارة والكبار ──
 app.get("/api/staff/applications", loadAuth, needStaff, wrap(async (req, res) => {
     const st = ["pending", "approved", "rejected"].includes(req.query.status) ? req.query.status : "pending";
-    const list = await Account.find({ status: st }, { passwordHash: 0 }).sort({ createdAt: -1 }).limit(100).lean();
+    const list = await Account.find({ status: st }, { passwordHash: 0, tmpPass: 0 }).sort({ createdAt: -1 }).limit(100).lean();
     res.json(list.map(a => ({ uid: a.uid, tag: a.discordTag, kind: a.kind, name: a.fullName, age: a.age, email: a.email, rank: a.rank, answers: a.answers, status: a.status, rejectReason: a.rejectReason, createdAt: a.createdAt, by: a.reviewedByTag })));
 }));
 app.post("/api/staff/applications/:uid/approve", loadAuth, needStaff, wrap(async (req, res) => {
@@ -667,7 +669,7 @@ app.get("/api/staff/people", loadAuth, needStaff, wrap(async (req, res) => {
     const q = clip(req.query.q, 40); const f = { status: "approved" };
     if (["citizen", "military"].includes(req.query.kind)) f.kind = req.query.kind;
     if (q) { const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"); f.$or = [{ fullName: rx }, { civilId: rx }, { uid: rx }, { discordTag: rx }]; }
-    const list = await Account.find(f, { passwordHash: 0, answers: 0 }).sort({ createdAt: -1 }).limit(60).lean();
+    const list = await Account.find(f, { passwordHash: 0, tmpPass: 0, answers: 0 }).sort({ createdAt: -1 }).limit(60).lean();
     res.json(list.map(a => ({ uid: a.uid, tag: a.discordTag, kind: a.kind, name: a.fullName, civilId: a.civilId, job: a.job, rank: a.rank, isAdmin: a.isAdmin, isSenior: a.isSenior, suspended: a.suspended })));
 }));
 app.post("/api/staff/people/:uid/civil-id", loadAuth, needStaff, wrap(async (req, res) => {
