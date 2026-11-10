@@ -1,45 +1,5 @@
-// ===================== نظام النشر من فلاش المطورين (Release Loader) =====================
-// فلاش الرسمي: لو وصله إصدار من فلاش المطورين (محفوظ بالداتابيس) يشغله بدل هذا الملف. أي خطأ => يكمل بهذا الملف عادي.
-const __DEV_MODE__ = /^(1|true|yes)$/i.test(String(process.env.DEV_MODE || ""));
-(function () {
-    try {
-        const fs = require("fs"), path = require("path"), zlib = require("zlib"), cr = require("crypto");
-        if (global.__FLASH_RELEASE__) return;
-        const baseCode = fs.readFileSync(__filename);
-        global.__FLASH_BASE_HASH__ = cr.createHash("sha256").update(baseCode).digest("hex");
-        global.__FLASH_BASE_FILE__ = __filename;
-        if (__DEV_MODE__ || !process.env.MONGO_URI || !process.env.DEPLOY_SECRET) return;
-        const fetchScript = 'const M=require("mongoose").mongo.MongoClient;(async()=>{const c=new M(process.env.MONGO_URI,{serverSelectionTimeoutMS:15000});await c.connect();' +
-            'const d=await c.db().collection("flash_releases").find({bad:{$ne:true},baseHash:process.env.FLASH_BASE_HASH}).sort({at:-1}).limit(1).toArray();await c.close();' +
-            'process.stdout.write(JSON.stringify(d[0]?{hash:d[0].hash,code:d[0].code}:null));})().catch(()=>process.stdout.write("null"));';
-        let out = "null";
-        try {
-            out = require("child_process").execFileSync(process.execPath, ["-e", fetchScript], {
-                cwd: __dirname, timeout: 30000, maxBuffer: 64 * 1024 * 1024,
-                env: Object.assign({}, process.env, { FLASH_BASE_HASH: global.__FLASH_BASE_HASH__ }), stdio: ["ignore", "pipe", "ignore"],
-            }).toString("utf8");
-        } catch (e) { return; }
-        const rel = JSON.parse(out || "null");
-        if (!rel || !rel.code || !rel.hash) return;
-        const code = zlib.gunzipSync(Buffer.from(rel.code, "base64"));
-        if (cr.createHash("sha256").update(code).digest("hex") !== rel.hash) return;
-        // حماية من حلقة الانهيار: لو الإصدار فشل يقوم 3 مرات ورا بعض، نرجع لهذا الملف
-        const markerFile = path.join(__dirname, "flash_boot.json");
-        let mk = {}; try { mk = JSON.parse(fs.readFileSync(markerFile, "utf8")); } catch (e) {}
-        const tries = mk.hash === rel.hash ? (mk.tries || 0) : 0;
-        if (tries >= 3) { console.log("⚠️ الإصدار المنشور ما اشتغل 3 مرات، نكمل بالملف الأصلي"); return; }
-        fs.writeFileSync(markerFile, JSON.stringify({ hash: rel.hash, tries: tries + 1 }));
-        const relPath = path.join(__dirname, "flash_release.js");
-        fs.writeFileSync(relPath, code);
-        global.__FLASH_RELEASE__ = rel.hash;
-        console.log("📦 تشغيل الإصدار المنشور " + rel.hash.slice(0, 12));
-        try { require(relPath); }
-        catch (e) { console.error("❌ الإصدار المنشور فشل عند التشغيل:", e && e.stack || e); process.exit(1); }
-        global.__FLASH_RELEASE_LOADED__ = true;
-    } catch (e) { console.log("⚠️ Release loader:", e && e.message); }
-})();
-if (global.__FLASH_RELEASE_LOADED__) return;
-// ==========================================================================================
+// (تم حذف فلاش المطورين ونظام النشر)
+const __DEV_MODE__ = false;
 
 const express = require("express");
 const session = require("express-session");
@@ -124,11 +84,8 @@ const CONFIG = {
     PATROL_ROLE_ID: process.env.PATROL_ROLE_ID || "1500064443537686588",
     ROAD_SECURITY_ROLE_ID: process.env.ROAD_SECURITY_ROLE_ID || "1533192878510178304",
 
+    // القطاعات: الشرطة العسكرية هي الثابتة الوحيدة. باقي القطاعات يضيفها ويحذفها الكبار من الموقع (تنحمل من الداتابيس)
     SECTORS: {
-        patrol: "الدوريات",
-        roadSecurity: "أمن الطرق",
-        antiDrugs: "مكافحة المخدرات",
-        cyber: "الأمن السيبراني",
         mp: "الشرطة العسكرية",
     },
 
@@ -169,7 +126,7 @@ const CONFIG = {
 };
 
 mongoose.connect(CONFIG.MONGO_URI)
-    .then(async () => { console.log("✅ MongoDB connected"); await copyOldMainDb().catch(e => console.error("❌ فشل نسخ القاعدة القديمة:", e.message)); await ensureSeniorAccount(); await ensureDevBots(); await ensureCardNumbers(); await migrateMpSector(); await ensureSectorFields(); await loadInvestigations(); await loadCourt(); })
+    .then(async () => { console.log("✅ MongoDB connected"); await copyOldMainDb().catch(e => console.error("❌ فشل نسخ القاعدة القديمة:", e.message)); await ensureSeniorAccount(); await loadSectorDefs().catch(e => console.error("❌ فشل تحميل القطاعات:", e.message)); await migrateLegacySectors(); await ensureCardNumbers(); await migrateMpSector(); await ensureSectorFields(); await loadInvestigations(); await loadCourt(); })
     .catch(err => console.log("❌ MongoDB error:", err));
 
 // ── قاعدة بيانات منفصلة لصور المخالفات (base64): حط عنوانها في PHOTOS_MONGO_URI ──
@@ -532,41 +489,6 @@ async function ensureSeniorAccount() {
     } catch (e) { console.error("❌ فشل تحميل حسابات كبار المسؤولين:", e.message); }
 }
 
-// ================= حسابات وهمية للتجربة (فلاش المطورين فقط) =================
-const DEV_BOTS = [
-    { n: 1, name: "بوت الدوريات",        sector: "patrol",       rank: "جندي",  unit: "P-101" },
-    { n: 2, name: "بوت أمن الطرق",       sector: "roadSecurity", rank: "عريف",  unit: "R-202" },
-    { n: 3, name: "بوت مكافحة المخدرات", sector: "antiDrugs",    rank: "رقيب",  unit: "D-303" },
-    { n: 4, name: "بوت الأمن السيبراني", sector: "cyber",        rank: "ملازم", unit: "C-404" },
-    { n: 5, name: "بوت الشرطة العسكرية", sector: "mp",           rank: "نقيب",  unit: "M-505" },
-];
-async function ensureDevBots() {
-    if (!__DEV_MODE__) return;
-    try {
-        const settings = await getSettings();
-        let made = 0;
-        for (const b of DEV_BOTS) {
-            const email = "bot" + b.n + "@flash.dev";
-            if (await Account.findOne({ email }, { _id: 1 }).lean()) continue;
-            const uid = "udevbot" + String(b.n).padStart(2, "0");
-            const pw = "Bot@12345";
-            await Account.create({
-                uid, email, fullName: b.name, age: 25, nationality: "سعودي",
-                passwordHash: hashPassword(pw), passwordEnc: encryptText(pw),
-                status: "approved", sector: b.sector, isMP: b.sector === "mp",
-                answers: { available: true, capable: true, terms: true },
-            });
-            let pts = 0; try { pts = await pointsForReachingRank(b.rank, settings); } catch (e) {}
-            await Personnel.updateOne({ discord: uid }, { $set: {
-                discordTag: b.name, registeredName: b.name, unit: b.unit, rank: b.rank, points: pts || 0,
-                sector: b.sector, leaveBalance: settings.leaveBalanceDefault || 10, cardNumber: await genCardNumber(),
-            } }, { upsert: true });
-            made++;
-        }
-        if (made) console.log("🤖 تم إنشاء " + made + " حسابات وهمية للتجربة (bot1@flash.dev ... bot5@flash.dev | كلمة السر Bot@12345)");
-    } catch (e) { console.error("❌ فشل إنشاء الحسابات الوهمية:", e.message); }
-}
-
 const ViolationSchema = new mongoose.Schema({
     reporterDiscord: String,
     reporterTag: String,
@@ -806,36 +728,7 @@ const SettingsSchema = new mongoose.Schema({
     stealthMode: { type: Boolean, default: false },
     adminList: { type: [String], default: [] },
     rankThresholds: { type: Map, of: Number, default: {} },
-    sectorLeadership: {
-        patrol: {
-            commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
-            deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
-            personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
-            attendanceOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
-            violationsOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
-        },
-        roadSecurity: {
-            commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
-            deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
-            personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
-            attendanceOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
-            violationsOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
-        },
-        antiDrugs: {
-            commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
-            deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
-            personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
-            attendanceOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
-            violationsOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
-        },
-        cyber: {
-            commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
-            deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
-            personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
-            attendanceOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
-            violationsOfficers: { type: [{ _id: false, id: String, name: String }], default: [] },
-        },
-    },
+    sectorLeadership: { type: mongoose.Schema.Types.Mixed, default: {} },
     mpLeadership: {
         commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
         deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
@@ -1004,6 +897,32 @@ async function endLeaveOnAttendance(uid) {
     const leave = await LeaveRequest.findOne({ discord: uid, status: "approved" });
     if (!leave) return;
     await finalizeLeave(leave, "تلقائي (سجّل حضور أثناء الإجازة)");
+}
+
+// ================= القطاعات الديناميكية (الكبار يضيفون ويحذفون) =================
+const SectorDefSchema = new mongoose.Schema({
+    key: { type: String, unique: true, index: true },
+    label: String,
+    createdBy: String, createdByName: String,
+    createdAt: { type: Date, default: Date.now },
+});
+const SectorDef = mongoose.model("SectorDef", SectorDefSchema);
+const LEGACY_SECTOR_KEYS = ["patrol", "roadSecurity", "antiDrugs", "cyber"];
+async function loadSectorDefs() {
+    const defs = await SectorDef.find({}).sort({ createdAt: 1 }).lean();
+    for (const k of Object.keys(CONFIG.SECTORS)) if (k !== "mp") delete CONFIG.SECTORS[k];
+    for (const d of defs) CONFIG.SECTORS[d.key] = d.label;
+    return defs;
+}
+// القطاعات القديمة (الدوريات/أمن الطرق/المكافحة/السيبراني) انحذفت: أعضاؤها يصيرون بدون قطاع (الرتبة والنقاط واليونت تبقى)
+async function migrateLegacySectors() {
+    try {
+        const q = { sector: { $in: LEGACY_SECTOR_KEYS } };
+        const a = await Account.updateMany(q, { $set: { sector: null } });
+        const pr = await Personnel.updateMany(q, { $set: { sector: null } });
+        const n = (a.modifiedCount || 0) + (pr.modifiedCount || 0);
+        if (n) console.log("✅ القطاعات القديمة انحذفت: " + (a.modifiedCount || 0) + " حساب صاروا بدون قطاع (الرتب والنقاط واليونت محفوظة)");
+    } catch (e) { console.error("❌ فشل ترحيل القطاعات القديمة:", e.message); }
 }
 
 // قيادة القطاع: الشرطة العسكرية قطاع مثل غيرها، وبياناتها محفوظة في mpLeadership
@@ -1862,78 +1781,6 @@ app.use(function (req, res, next) {
     if (req.method === "GET" && !/^\/(api|bank|healthz|static|assets)\b/.test(req.path) && String(req.headers.accept || "").indexOf("text/html") !== -1) bankWakeSoft();
     next();
 });
-// ================= النشر من فلاش المطورين إلى فلاش الرسمي =================
-// المتغيرات: DEPLOY_SECRET (نفس القيمة على الموقعين) — وعلى المطورين بس: DEV_MODE=1 و DEPLOY_TARGET_URL (رابط الرسمي)
-const DEPLOY_SETTINGS_KEYS = ["rankThresholds", "warningPenalties", "leaveBalanceDefault", "notifTitle", "notifBody", "supportCanned", "attConfig"];
-const deploySha = (x) => crypto.createHash("sha256").update(x).digest("hex");
-const deploySign = (secret, ts, action, hash, setHash) => crypto.createHmac("sha256", secret).update([ts, action, hash || "", setHash || ""].join(".")).digest("hex");
-function deployRunningHash() { return global.__FLASH_RELEASE__ || global.__FLASH_BASE_HASH__ || ""; }
-function deployRestartSoon() { setTimeout(() => { console.log("🔄 إعادة تشغيل بعد النشر..."); process.exit(0); }, 1500); }
-
-// ---- الاستقبال (فلاش الرسمي فقط) ----
-app.post("/deploy/receive", async (req, res) => {
-    if (__DEV_MODE__) return res.status(404).json({ error: "غير متاح" });
-    const secret = String(process.env.DEPLOY_SECRET || "");
-    if (!secret) return res.status(503).json({ error: "DEPLOY_SECRET غير مضبوط على الرسمي" });
-    const b = req.body || {};
-    const ts = Number(b.ts || 0), action = String(b.action || "");
-    if (!ts || Math.abs(Date.now() - ts) > 5 * 60 * 1000) return res.status(401).json({ error: "الوقت غير متطابق بين الموقعين (فرق أكثر من 5 دقايق)" });
-    const settingsJson = typeof b.settingsJson === "string" ? b.settingsJson : "";
-    const expect = deploySign(secret, ts, action, String(b.hash || ""), settingsJson ? deploySha(settingsJson) : "");
-    const got = String(b.sig || "");
-    if (got.length !== expect.length || !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expect))) return res.status(401).json({ error: "التوقيع غلط — تأكد DEPLOY_SECRET نفسه على الموقعين" });
-    const col = mongoose.connection.db.collection("flash_releases");
-    const baseHash = global.__FLASH_BASE_HASH__ || "";
-
-    if (action === "status") {
-        const rels = await col.find({ baseHash }, { projection: { code: 0 } }).sort({ at: -1 }).limit(6).toArray();
-        return res.json({ ok: true, ver: APP_VER, running: deployRunningHash().slice(0, 12), fromRelease: !!global.__FLASH_RELEASE__, releases: rels.map(r => ({ hash: String(r.hash).slice(0, 12), at: +r.at, by: r.by || "", bad: !!r.bad })) });
-    }
-
-    if (action === "rollback") {
-        const last = await col.find({ baseHash, bad: { $ne: true } }).sort({ at: -1 }).limit(1).toArray();
-        if (!last.length) return res.status(400).json({ error: "ما فيه إصدار منشور للرجوع منه (الرسمي يشتغل على ملفه الأصلي)" });
-        await col.updateOne({ _id: last[0]._id }, { $set: { bad: true, badAt: new Date() } });
-        await logEvent({ action: "رجوع للنسخة السابقة (نشر)", actorId: "deploy", actorTag: String(b.by || "المطورين").slice(0, 60), details: String(last[0].hash).slice(0, 12) });
-        res.json({ ok: true, restart: true });
-        return deployRestartSoon();
-    }
-
-    if (action === "publish") {
-        let restart = false, codeNote = "";
-        if (b.code) {
-            if (typeof b.code !== "string" || b.code.length > 30 * 1024 * 1024) return res.status(400).json({ error: "الكود كبير أو غير صالح" });
-            let code;
-            try { code = require("zlib").gunzipSync(Buffer.from(b.code, "base64")); } catch (e) { return res.status(400).json({ error: "فشل فك ضغط الكود" }); }
-            if (deploySha(code) !== String(b.hash || "")) return res.status(400).json({ error: "الكود وصل ناقص (الهاش ما يطابق)" });
-            try { new (require("vm").Script)(require("module").wrap(code.toString("utf8")), { filename: "release.js" }); }
-            catch (e) { return res.status(400).json({ error: "الكود فيه خطأ كتابة ورفضه الرسمي: " + e.message }); }
-            const lastRel = await col.find({ baseHash, bad: { $ne: true } }, { projection: { hash: 1 } }).sort({ at: -1 }).limit(1).toArray();
-            if (b.hash === deployRunningHash() || (lastRel.length && lastRel[0].hash === b.hash)) { codeNote = "نفس النسخة اللي شغالة، ما تغير الكود"; }
-            else {
-                await col.insertOne({ hash: b.hash, baseHash, at: new Date(), by: String(b.by || "").slice(0, 60), code: b.code, bad: false });
-                const old = await col.find({ baseHash }, { projection: { _id: 1 } }).sort({ at: -1 }).skip(5).toArray();
-                if (old.length) await col.deleteMany({ _id: { $in: old.map(o => o._id) } });
-                restart = true; codeNote = "تم حفظ النسخة الجديدة";
-            }
-        }
-        let setNote = "";
-        if (settingsJson) {
-            let o; try { o = JSON.parse(settingsJson); } catch (e) { return res.status(400).json({ error: "الإعدادات غير صالحة" }); }
-            const s = await getSettings();
-            let n = 0;
-            for (const k of DEPLOY_SETTINGS_KEYS) if (Object.prototype.hasOwnProperty.call(o, k) && o[k] !== undefined) { s[k] = o[k]; s.markModified(k); n++; }
-            await s.save();
-            setNote = "انتقلت " + n + " إعدادات";
-        }
-        await logEvent({ action: "نشر من فلاش المطورين", actorId: "deploy", actorTag: String(b.by || "المطورين").slice(0, 60), details: [codeNote, setNote].filter(Boolean).join(" | ") });
-        res.json({ ok: true, restart, codeNote, setNote });
-        if (restart) deployRestartSoon();
-        return;
-    }
-    res.status(400).json({ error: "أمر غير معروف" });
-});
-
 // ================= تثبيت الموقع كتطبيق (إضافة للشاشة الرئيسية) =================
 const FLASH_ICONS = (function () {
     const zlib = require("zlib");
@@ -2086,7 +1933,7 @@ app.use((req, res, next) => {
     if (!req.user || req.user.kind !== "citizen") return next();
     const p = req.path;
     if (!/^\/(api|bank)(\/|$)/.test(p)) return next();
-    if (/^\/(api\/(me|citizen|cz|bank\/sso|bank\/status|pwa\/ping)|bank)(\/|$)/.test(p)) return next();
+    if (/^\/(api\/(me|events|citizen|cz|bank\/sso|bank\/status|pwa\/ping)|bank)(\/|$)/.test(p)) return next();
     return res.status(403).json({ error: "هذا القسم غير متاح للمواطنين" });
 });
 app.get("/api/me", (req, res, next) => { if (req.user && req.user.kind === "citizen") return czMe(req, res); next(); });
@@ -5686,59 +5533,6 @@ app.post("/api/owner/officer-requests/:id/reject", ensureAuth, async (req, res) 
     res.json({ ok: true });
 });
 
-// ---- الإرسال (فلاش المطورين فقط، للمالك) ----
-async function deployCall(action, extra) {
-    const secret = String(process.env.DEPLOY_SECRET || "");
-    const target = String(process.env.DEPLOY_TARGET_URL || "").replace(/\/+$/, "");
-    if (!secret || !target) throw new Error("ضبط DEPLOY_SECRET و DEPLOY_TARGET_URL على فلاش المطورين أول");
-    const ts = Date.now();
-    const x = extra || {};
-    const sig = deploySign(secret, ts, action, x.hash || "", x.settingsJson ? deploySha(x.settingsJson) : "");
-    let r;
-    try { r = await fetch(target + "/deploy/receive", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.assign({ ts, action, sig }, x)), signal: AbortSignal.timeout(90000) }); }
-    catch (e) { throw new Error("ما قدرت أوصل للرسمي: " + (e && e.message ? e.message : e)); }
-    let j = null; try { j = await r.json(); } catch (e) {}
-    if (!r.ok || !j || j.ok === false) throw new Error((j && j.error) || ("الرسمي رد بخطأ " + r.status));
-    return j;
-}
-function devOwnerOnly(req, res) {
-    if (!__DEV_MODE__) { res.status(404).json({ error: "متاح فقط في فلاش المطورين" }); return false; }
-    if (!isOwnerUid(req.user.id)) { res.status(403).json({ error: "غير مصرح" }); return false; }
-    return true;
-}
-app.get("/api/dev/publish/info", ensureAuth, async (req, res) => {
-    if (!devOwnerOnly(req, res)) return;
-    const code = require("fs").readFileSync(__filename);
-    const out = { devHash: deploySha(code).slice(0, 12), target: String(process.env.DEPLOY_TARGET_URL || ""), configured: !!(process.env.DEPLOY_SECRET && process.env.DEPLOY_TARGET_URL), official: null, officialError: "" };
-    if (out.configured) { try { out.official = await deployCall("status"); } catch (e) { out.officialError = e.message; } }
-    res.json(out);
-});
-app.post("/api/dev/publish", ensureAuth, async (req, res) => {
-    if (!devOwnerOnly(req, res)) return;
-    const wantCode = !!(req.body || {}).code, wantSettings = !!(req.body || {}).settings;
-    if (!wantCode && !wantSettings) return res.status(400).json({ error: "اختار شي تنشره (الكود أو الإعدادات)" });
-    const extra = { by: req.user.username || "المطورين" };
-    if (wantCode) {
-        const code = require("fs").readFileSync(__filename);
-        extra.hash = deploySha(code);
-        extra.code = require("zlib").gzipSync(code).toString("base64");
-    }
-    if (wantSettings) {
-        const s = await getSettings();
-        const o = s.toObject({ flattenMaps: true }), pick = {};
-        for (const k of DEPLOY_SETTINGS_KEYS) if (o[k] !== undefined) pick[k] = o[k];
-        extra.settingsJson = JSON.stringify(pick);
-    }
-    const j = await deployCall("publish", extra);
-    await logEvent({ action: "نشر لفلاش الرسمي", actorId: req.user.id, actorTag: req.user.username, details: [j.codeNote, j.setNote].filter(Boolean).join(" | ") });
-    res.json(j);
-});
-app.post("/api/dev/rollback", ensureAuth, async (req, res) => {
-    if (!devOwnerOnly(req, res)) return;
-    const j = await deployCall("rollback", { by: req.user.username || "المطورين" });
-    res.json(j);
-});
-
 app.get("/api/owner/updates", ensureAuth, async (req, res) => {
     if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
     const list = await FlashUpdate.find({}).sort({ createdAt: -1 }).limit(100).lean();
@@ -5837,6 +5631,49 @@ app.get("/api/senior/sectors", ensureSeniorAdmin, async (req, res) => {
 });
 
 const SECTOR_ROLE_LABELS = { commander: "قائد", deputy: "نائب", personnelOfficer: "مسؤول أفراد" };
+
+// قائمة القطاعات الحالية (لكل المسجلين)
+app.get("/api/sectors", ensureAuth, (req, res) => { res.json({ sectors: CONFIG.SECTORS }); });
+
+// إضافة قطاع جديد (الكبار) — يعتبر قطاع عسكري وأزراره نفس أزرار الدوريات
+app.post("/api/senior/sectors/add", ensureSeniorAdmin, async (req, res) => {
+    const name = String((req.body || {}).name || "").trim().replace(/\s+/g, " ");
+    if (name.length < 2 || name.length > 40) return res.status(400).json({ error: "اسم القطاع من حرفين إلى 40 حرف" });
+    if (Object.values(CONFIG.SECTORS).some(v => v === name)) return res.status(400).json({ error: "فيه قطاع بنفس الاسم" });
+    const key = "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    await SectorDef.create({ key, label: name, createdBy: req.user.id, createdByName: req.user.username });
+    CONFIG.SECTORS[key] = name;
+    await logEvent({ action: "إضافة قطاع", actorId: req.user.id, actorTag: req.user.username, details: name });
+    sseBroadcast("sectors", { t: Date.now() }, c => !!c.uid);
+    res.json({ ok: true, key, label: name });
+});
+
+// حذف قطاع (الكبار): الأعضاء يصيرون بدون قطاع ويتسجل ذلك، والرتبة والنقاط واليونت تبقى محفوظة
+app.post("/api/senior/sectors/:sector/delete", ensureSeniorAdmin, async (req, res) => {
+    const key = String(req.params.sector || "");
+    if (key === "mp") return res.status(400).json({ error: "الشرطة العسكرية قطاع ثابت وما ينحذف" });
+    if (!CONFIG.SECTORS[key]) return res.status(400).json({ error: "قطاع غير معروف" });
+    const label = CONFIG.SECTORS[key];
+    const accs = await Account.find({ sector: key }, { uid: 1, fullName: 1 }).lean();
+    await Account.updateMany({ sector: key }, { $set: { sector: null } });
+    await Personnel.updateMany({ sector: key }, { $set: { sector: null } });
+    await SectorDef.deleteOne({ key });
+    delete CONFIG.SECTORS[key];
+    try {
+        const settings = await getSettings();
+        if (settings.sectorLeadership && settings.sectorLeadership[key]) {
+            delete settings.sectorLeadership[key];
+            settings.markModified("sectorLeadership");
+            await settings.save();
+        }
+    } catch (e) { console.error("❌ فشل مسح قيادة القطاع المحذوف:", e.message); }
+    await logEvent({ action: "حذف قطاع", actorId: req.user.id, actorTag: req.user.username, details: label + " — " + accs.length + " عضو صاروا بدون قطاع (الرتبة والنقاط واليونت محفوظة)" });
+    for (const a of accs) {
+        await logEvent({ action: "بدون قطاع (انحذف قطاعه)", discordId: a.uid, actorId: req.user.id, actorTag: req.user.username, details: (a.fullName || a.uid) + " — انحذف قطاع «" + label + "» وصار بدون قطاع" }).catch(() => {});
+    }
+    sseBroadcast("sectors", { t: Date.now() }, c => !!c.uid);
+    res.json({ ok: true, affected: accs.length });
+});
 
 app.post("/api/senior/sectors/:sector/assign", ensureSeniorAdmin, async (req, res) => {
     const { sector } = req.params;
@@ -8462,6 +8299,7 @@ app.delete("/api/support/admin/closed", async (req, res) => {
 
 // ============================================================================
 // 🎖️ سلك الضباط — تقديم + مقابلة (روم صوتي WebRTC) + تدريب
+// ملاحظة: هذا هو نظام «سلك الضباط». أزراره مخفية بالموقع حالياً (OFFICERS_CORPS_ENABLED في الواجهة) والنظام نفسه باقي هنا لو تبي ترجعه.
 // ============================================================================
 const OFFICER_QUESTIONS = [
     "لماذا تريد الانضمام إلى سلك الضباط؟",
@@ -12755,6 +12593,25 @@ app.get("/", (req, res) => {
     .mc-photo { position: absolute; object-fit: cover; border-radius: 0.8cqw; background: #e5e7eb; }
     .mc-bc { position: absolute; display: flex; align-items: center; justify-content: flex-start; cursor: pointer; z-index: 1; -webkit-tap-highlight-color: transparent; text-decoration: none; }
     .mc-bc img { height: 100%; aspect-ratio: 1; background: #fff; padding: 0.3cqw; border-radius: 0.6cqw; box-shadow: 0 0 0 0.25cqw rgba(15,23,42,0.35); }
+
+    /* ===== البطاقة العسكرية الفخمة ===== */
+    .lxc { background: radial-gradient(120% 140% at 85% 0%, #1d3a34 0%, #0e1f1c 45%, #070f0e 100%); color: #f3e3b3; font-family: inherit; }
+    .lxc::before { content: ''; position: absolute; inset: 0; background: repeating-linear-gradient(135deg, rgba(232,195,106,0.05) 0 0.4cqw, transparent 0.4cqw 2.2cqw); }
+    .lxc::after { content: ''; position: absolute; inset: 1.6cqw; border: 0.35cqw solid #d9b25c; border-radius: 2cqw; box-shadow: inset 0 0 0 0.35cqw rgba(0,0,0,0.5), inset 0 0 0 0.6cqw rgba(217,178,92,0.35); pointer-events: none; }
+    .lxc .lx-star { position: absolute; right: 5cqw; top: 3.6cqw; width: 7.4cqw; height: 7.4cqw; border-radius: 50%; background: radial-gradient(circle at 35% 30%, #f6df9b, #b88a2e); color: #1a2a25; display: flex; align-items: center; justify-content: center; font-size: 4.6cqw; box-shadow: 0 0 2cqw rgba(232,195,106,0.45); }
+    .lxc .lx-title { position: absolute; right: 14cqw; top: 4cqw; font-size: 3.3cqw; font-weight: 900; color: #f6df9b; letter-spacing: 0.02em; line-height: 1.2; }
+    .lxc .lx-sub { position: absolute; right: 14cqw; top: 8.6cqw; font-size: 1.9cqw; color: #bfae7a; letter-spacing: 0.18em; direction: ltr; text-align: right; }
+    .lxc .lx-chip { position: absolute; left: 5cqw; top: 4cqw; width: 8cqw; height: 6cqw; border-radius: 1cqw; background: linear-gradient(135deg, #f2d98f, #b88a2e 55%, #e8c36a); box-shadow: inset 0 0 0 0.25cqw rgba(0,0,0,0.35); }
+    .lxc .lx-chip::before { content: ''; position: absolute; inset: 1.2cqw 1.6cqw; border: 0.25cqw solid rgba(0,0,0,0.35); border-radius: 0.6cqw; }
+    .lxc .lx-photo { position: absolute; left: 5cqw; top: 14cqw; width: 19cqw; height: 25cqw; border-radius: 1.4cqw; object-fit: cover; background: #14231f; border: 0.4cqw solid #d9b25c; box-shadow: 0 0 2cqw rgba(0,0,0,0.6); }
+    .lxc .lx-nophoto { position: absolute; left: 5cqw; top: 14cqw; width: 19cqw; height: 25cqw; border-radius: 1.4cqw; background: rgba(255,255,255,0.05); border: 0.4cqw dashed rgba(217,178,92,0.5); display: flex; align-items: center; justify-content: center; font-size: 7cqw; color: rgba(217,178,92,0.5); }
+    .lxc .lx-f { position: absolute; right: 6cqw; width: 62cqw; display: flex; align-items: baseline; gap: 1.6cqw; white-space: nowrap; overflow: hidden; direction: rtl; }
+    .lxc .lx-f i { font-style: normal; font-size: 1.9cqw; color: #bfae7a; min-width: 11cqw; }
+    .lxc .lx-f b { font-weight: 800; color: #fff6d8; overflow: hidden; text-overflow: ellipsis; }
+    .lxc .lx-bar { position: absolute; right: 6cqw; bottom: 4.4cqw; width: 40cqw; height: 6.2cqw; display: block; padding: 0.6cqw 1cqw; border-radius: 0.8cqw; background: rgba(0,0,0,0.35); border: 0.2cqw solid rgba(217,178,92,0.4); }
+    .lxc .lx-bar svg { width: 100%; height: 100%; display: block; }
+    .lxc .lx-num { position: absolute; left: 5cqw; bottom: 4.6cqw; font-size: 3cqw; font-weight: 900; color: #f6df9b; direction: ltr; letter-spacing: 0.16em; text-align: left; }
+    .lxc .lx-numl { position: absolute; left: 5cqw; bottom: 8.6cqw; font-size: 1.7cqw; color: #bfae7a; direction: rtl; }
     .mc-adm-in { position: absolute; z-index: 1; font-size: 2.1cqw; font-weight: 800; line-height: 1.2; color: #dc2626; background: rgba(255,255,255,0.88); border: 0.2cqw solid #dc2626; border-radius: 99px; padding: 0.15cqw 1.2cqw; pointer-events: none; }
     .mc-warn { margin-top: 8px; padding: 7px 10px; border-radius: 10px; background: rgba(220,38,38,0.14); border: 1px solid rgba(248,113,113,0.55); color: #fca5a5; font-size: 12.5px; font-weight: 700; line-height: 1.7; text-align: center; }
     .mc-adm { text-align: center; margin-top: 8px; font-weight: 800; font-size: 14px; color: #ef4444; }
@@ -13321,7 +13178,6 @@ ${__DEV_MODE__ ? '<div style="position:fixed;top:0;left:50%;transform:translateX
     <button class="btn sm" style="background:#0e7490;" onclick="offaOpenCommandCenter()">🖥️ غرفة التحكم</button>
     <button class="btn sm" style="background:#be123c;" onclick="offaOpenLive()">📡 العمليات الحية</button>
     <button class="btn sm" style="background:#7c3aed;" onclick="offaOpenUpdates()">🛠️ تحديثات المطور</button>
-    ${__DEV_MODE__ ? '<button class="btn sm" style="background:#16a34a;" onclick="devOpenPublish()">🚀 نشر للرسمي</button>' : ''}
     <button class="btn sm" style="background:#312e81;" onclick="offaOpenDevices()">📱 الأجهزة</button>
     <button id="owner-stealth-btn" class="btn sm" style="background:#374151;" onclick="offaToggleStealth()">👻 وضع التخفي</button>
     <button id="owner-lock-btn" class="btn sm danger" onclick="offaToggleLockdown()">🚨 إغلاق الموقع</button>
@@ -13365,7 +13221,41 @@ ${__DEV_MODE__ ? '<div style="position:fixed;top:0;left:50%;transform:translateX
 
 <script>
 const MILITARY_RANKS = ${JSON.stringify(CONFIG.MILITARY_RANKS)};
-const SECTOR_LABELS = ${JSON.stringify(CONFIG.SECTORS)};
+/* ═══════════════════════════════════════════════════════════════════════════
+   ملاحظة مهمة: نظام «سلك الضباط» (التقديم + المقابلة الصوتية + التدريب + الرتب) موجود كامل بالكود،
+   لكن كل أزراره مخفية حالياً (للمالك وللكل). لإرجاعه غيّر OFFICERS_CORPS_ENABLED إلى true.
+   نفس الشي للوحة الأمن السيبراني: CYBER_PANEL_ENABLED.
+   ═══════════════════════════════════════════════════════════════════════════ */
+var OFFICERS_CORPS_ENABLED = false;
+var CYBER_PANEL_ENABLED = false;
+var SECTOR_LABELS = { mp: 'الشرطة العسكرية' };
+// القطاعات تتحدث لحظياً (إضافة/حذف من الكبار) بدون ريفرش
+async function flSectorsSync() {
+    try {
+        var d = await api('/api/sectors', { noLock: true });
+        var s = (d && d.sectors) || {};
+        Object.keys(SECTOR_LABELS).forEach(function (k) { delete SECTOR_LABELS[k]; });
+        Object.keys(s).forEach(function (k) { SECTOR_LABELS[k] = s[k]; });
+        flSectorsRebuild();
+    } catch (e) {}
+}
+function flSectorsRebuild() {
+    try {
+        ACC_SECTORS.length = 0;
+        ACC_SECTORS.push(['', 'بدون قطاع']);
+        Object.keys(SECTOR_LABELS).forEach(function (k) { ACC_SECTORS.push([k, SECTOR_LABELS[k]]); });
+        FL_SEC_KEYS.length = 0;
+        Object.keys(FL_SEC_LABELS).forEach(function (k) { delete FL_SEC_LABELS[k]; });
+        Object.keys(SECTOR_LABELS).forEach(function (k) { if (k !== 'mp') { FL_SEC_KEYS.push(k); FL_SEC_LABELS[k] = SECTOR_LABELS[k]; } });
+    } catch (e) {}
+}
+function flSectorsChanged() {
+    flSectorsSync().then(function () {
+        try { buildNav(); } catch (x) {}
+        try { if (typeof currentAdminTab !== 'undefined' && currentAdminTab === 'sectors' && document.getElementById('admin-content')) loadSectors(); } catch (x) {}
+        try { liveSyncSoon(); } catch (x) {}
+    });
+}
 let ME = null;
 var REAL_OWNER = false, OWNER_DISGUISE = false;
 try { OWNER_DISGUISE = sessionStorage.getItem('flOd') === '1'; } catch (e) {}
@@ -14836,6 +14726,7 @@ function spConnect() {
         es.addEventListener('sessionkick', function () { try { flSessionKicked(); } catch (x) {} });
         es.addEventListener('offann', function () { try { offAnnCheck(); } catch (x) {} });
         es.addEventListener('flashupdate', function () { try { flashUpdCheck(); } catch (x) {} });
+        es.addEventListener('sectors', function () { try { flSectorsChanged(); } catch (x) {} });
         es.addEventListener('lockchange', function (e) {
             try { var d = JSON.parse(e.data); if (!(ME && ME.isOwner)) { if (d.on) location.reload(); } } catch (x) {}
         });
@@ -16255,8 +16146,8 @@ function updateStealthBtn(on) {
 var CC_TIMER = null;
 
 /* ⚡ أوامر فلاش (المالك): فتح لوحات القيادة كقائد/نائب بصمت تام — ما ينسجل شي وما يظهر اسمك */
-var FL_SEC_KEYS = ['patrol', 'roadSecurity', 'antiDrugs'];
-var FL_SEC_LABELS = { patrol: 'الدوريات', roadSecurity: 'أمن الطرق', antiDrugs: 'مكافحة المخدرات' };
+var FL_SEC_KEYS = [];
+var FL_SEC_LABELS = {};
 function flCmdBack(fn, label) { return '<div style="margin-bottom:8px;"><button class="btn sm gray" onclick="' + fn + '">' + label + '</button></div>'; }
 function flCmdOpen() {
     ccStopLive();
@@ -16304,7 +16195,7 @@ function ccStopLive() { if (CC_TIMER) { clearInterval(CC_TIMER); CC_TIMER = null
 function ccRenderHtml(d) {
     var h = '<div id="cc-live-a"><div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">' +
         '<div class="card" onclick="offaOpenOnline()" style="flex:1;min-width:110px;text-align:center;cursor:pointer;"><div style="font-size:22px;">' + d.onlineNow + '</div><div style="font-size:11px;color:var(--muted);">متصل الآن</div></div>' +
-        '<div class="card" onclick="offaOpenOfficerReq()" style="flex:1;min-width:110px;text-align:center;cursor:pointer;"><div style="font-size:22px;">' + d.pendingApps + '</div><div style="font-size:11px;color:var(--muted);">طلبات سلك الضباط</div></div>' +
+        (OFFICERS_CORPS_ENABLED ? '<div class="card" onclick="offaOpenOfficerReq()" style="flex:1;min-width:110px;text-align:center;cursor:pointer;"><div style="font-size:22px;">' + d.pendingApps + '</div><div style="font-size:11px;color:var(--muted);">طلبات سلك الضباط</div></div>' : '') +
         '<div class="card" style="flex:1;min-width:110px;text-align:center;"><div style="font-size:22px;">' + d.pendingViolations + '</div><div style="font-size:11px;color:var(--muted);">مخالفات معلّقة</div></div>' +
         '</div>';
     h += '<div style="display:flex;gap:8px;margin-bottom:10px;">' +
@@ -16637,50 +16528,6 @@ async function offaDeleteUpdate(id) {
     } catch (e) { toast(e.message); }
 }
 
-function devRelRow(r) {
-    return '<div style="font-size:12px;display:flex;justify-content:space-between;gap:8px;padding:4px 0;border-bottom:1px solid var(--border);"><span>' + spEsc(r.hash) + (r.bad ? ' ↩️ (مرجّع)' : '') + '</span><span style="color:var(--muted);">' + new Date(r.at).toLocaleString('ar-SA') + '</span></div>';
-}
-async function devOpenPublish() {
-    ccStopLive();
-    ownerModalOpen('🚀 النشر لفلاش الرسمي', '<div style="color:var(--muted);">جارِ التحميل...</div>');
-    try {
-        var d = await api('/api/dev/publish/info', { noLock: true });
-        var h = '<div class="card" style="margin-bottom:10px;font-size:12px;">' +
-            '<div>🧪 نسخة المطورين الحالية: <b>' + spEsc(d.devHash) + '</b></div>';
-        if (!d.configured) h += '<div style="color:#f87171;margin-top:6px;">ضبط DEPLOY_SECRET و DEPLOY_TARGET_URL على هذا الموقع أول.</div>';
-        else if (d.officialError) h += '<div style="color:#f87171;margin-top:6px;">ما قدرت أوصل للرسمي: ' + spEsc(d.officialError) + '</div>';
-        else if (d.official) {
-            h += '<div style="margin-top:4px;">⚡ الرسمي شغال على: <b>' + spEsc(d.official.running) + '</b>' + (d.official.running === d.devHash ? ' ✅ نفس نسختك' : ' (يختلف عن نسختك)') + '</div>';
-            if (d.official.releases && d.official.releases.length) h += '<div style="margin-top:8px;"><b>آخر النسخ المنشورة:</b>' + d.official.releases.map(devRelRow).join('') + '</div>';
-        }
-        h += '</div>';
-        h += '<div class="card" style="margin-bottom:10px;">' +
-            '<label style="display:flex;gap:8px;align-items:flex-start;font-size:13px;margin-bottom:8px;"><input id="dp-code" type="checkbox" checked style="width:auto;margin-top:3px;"><span><b>نشر الكود</b><br><span style="color:var(--muted);font-size:11px;">الرسمي يحفظ النسخة ويعيد تشغيل نفسه، والأعضاء يتحدثون تلقائي بدون ما يسوون شي.</span></span></label>' +
-            '<label style="display:flex;gap:8px;align-items:flex-start;font-size:13px;"><input id="dp-set" type="checkbox" style="width:auto;margin-top:3px;"><span><b>نقل الإعدادات</b><br><span style="color:var(--muted);font-size:11px;">حدود الرتب، قائمة العقوبات، رصيد الإجازات، نص الإشعار، الردود الجاهزة، إعدادات الحضور. الحسابات والمناصب والبيانات ما تنتقل أبداً.</span></span></label>' +
-            '<button class="btn" style="margin-top:12px;width:100%;" onclick="devDoPublish()">🚀 نشر للرسمي</button>' +
-            '<button class="btn sm danger" style="margin-top:8px;width:100%;" onclick="devDoRollback()">↩️ رجوع للنسخة السابقة</button></div>';
-        ownerModalOpen('🚀 النشر لفلاش الرسمي', h);
-    } catch (e) { toast(e.message); }
-}
-async function devDoPublish() {
-    var c = !!(document.getElementById('dp-code') || {}).checked, s = !!(document.getElementById('dp-set') || {}).checked;
-    if (!c && !s) { toast('اختار شي تنشره'); return; }
-    if (!(await confirmModal('🚀 بينزل للرسمي الحين' + (c ? ' وبيعيد تشغيله ثواني والأعضاء يتحدثون تلقائي' : '') + '. متأكد؟'))) return;
-    try {
-        var j = await api('/api/dev/publish', { method: 'POST', body: JSON.stringify({ code: c, settings: s }), noLock: true });
-        toast('✅ ' + [j.codeNote, j.setNote].filter(Boolean).join(' - '));
-        setTimeout(devOpenPublish, 6000);
-    } catch (e) { toast(e.message); }
-}
-async function devDoRollback() {
-    if (!(await confirmModal('↩️ الرسمي بيرجع للنسخة اللي قبل آخر نشر (أو لملفه الأصلي) ويعيد تشغيله. متأكد؟'))) return;
-    try {
-        await api('/api/dev/rollback', { method: 'POST', noLock: true });
-        toast('↩️ تم الرجوع');
-        setTimeout(devOpenPublish, 6000);
-    } catch (e) { toast(e.message); }
-}
-
 function devLoginBtn(uid) {
     return (typeof REAL_OWNER !== 'undefined' && REAL_OWNER) ? '<button class="btn sm" style="background:#16a34a;color:#fff;" data-uid="' + spEsc(uid) + '" onclick="devLoginAs(this.dataset.uid)">🔑 دخول الحساب</button>' : '';
 }
@@ -16868,10 +16715,11 @@ async function czStart() {
     if (ME && ME.blocked) { renderBlocked(ME.reason); return; }
     czInjectStyle(); czSetNav();
     try { flPushInit(); } catch (e) {}
+    try { spReconnect(); } catch (e) {}
     try { fetch('/api/pwa/ping?sa=' + (flStandalone() ? 1 : 0)); } catch (e) {}
     await czGo(CZ.tab || 'home');
     if (CZ.timer) clearInterval(CZ.timer);
-    CZ.timer = setInterval(czTick, 15000);
+    CZ.timer = setInterval(czTick, 8000);
 }
 async function czTick() {
     try {
@@ -17153,6 +17001,7 @@ async function init() {
     if (ME.unassigned) { uaHardLock(); return; }
     uaHardClear();
     markOwnerSaved();
+    await flSectorsSync();
     if (ME.blocked) { if (ME.suspended) showSuspended(); renderBlocked(ME.reason); return; }
     if (ME.isOwner) {
         document.getElementById('owner-toolbar').style.display = 'flex';
@@ -17192,6 +17041,7 @@ function navRestore() {
 function buildNav() {
     const links = document.getElementById('nav-links');
     const mobile = document.getElementById('mobile-menu');
+    if (ME && ME.citizen) { try { czSetNav(); } catch (x) {} return; }
     if (!ME || ME.blocked) { links.innerHTML = ''; mobile.innerHTML = ''; return; }
     const items = [
         { label: '🏠 الرئيسية', fn: 'renderDashboard()' },
@@ -17212,7 +17062,7 @@ function buildNav() {
     );
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
     if (ME.isHighCommand) items.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
-    if (ME.cyber && (ME.cyber.isMember || ME.cyber.isLeader)) items.push({ label: '🛡️ الأمن السيبراني', fn: 'renderCyberPanel()' });
+    if (CYBER_PANEL_ENABLED && ME.cyber && (ME.cyber.isMember || ME.cyber.isLeader)) items.push({ label: '🛡️ الأمن السيبراني', fn: 'renderCyberPanel()' });
     if (ME.isViolationsOfficer) items.push({ label: '⚖️ مسؤول المخالفات', fn: 'renderViolationsOfficerPanel()' });
     if (ME.canFraud) items.push({ label: '🛡️ كشف التلاعب', fn: 'renderFraudPanel()' });
     if (ME.sectorViolOfficer) items.push({ label: '⚖️ مخالفات القطاع', fn: 'renderSectorViolOfficerPanel()' });
@@ -17224,8 +17074,9 @@ function buildNav() {
     if (ME.courtStaff) items.push({ label: '🔎 التحقيق العسكري', fn: 'renderInvPanel()' });
     if (ME.sectorInfo && ME.sectorInfo.sector !== 'cyber') items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) items.push({ label: '👥 مسؤول الأفراد', fn: 'renderPersonnelOfficerPanel()' });
-    items.push({ label: '🎖️ سلك الضباط', fn: 'renderOfficerPage()' });
-    if (ME.isTrainer && !ME.isSeniorAdmin) items.push({ label: '🏋️ صفحة المدرب', fn: 'renderTrainerPage()' });
+    /* ملاحظة: هنا سلك الضباط — النظام موجود بالكود وتم حذف الزر فقط. لإرجاعه شغّل OFFICERS_CORPS_ENABLED */
+    if (OFFICERS_CORPS_ENABLED) items.push({ label: '🎖️ سلك الضباط', fn: 'renderOfficerPage()' });
+    if (OFFICERS_CORPS_ENABLED && ME.isTrainer && !ME.isSeniorAdmin) items.push({ label: '🏋️ صفحة المدرب', fn: 'renderTrainerPage()' });
     items.push({ label: '🎧 الدعم', fn: 'spOpen()', cls: 'sp-nav-user' });
     if (ME.isAdmin) items.push({ label: '🎧 تذاكر الدعم', fn: 'renderSupportAdmin()', cls: 'sp-nav-admin' });
     if (document.documentElement.classList.contains('fl-standalone')) items.push({ label: '🔄 تحديث', fn: 'location.reload()' });
@@ -17239,7 +17090,7 @@ function renderFabs() {
     const fabs = [];
     if (ME.isSeniorAdmin) fabs.push({ label: '🛡️ لوحة كبار المسؤولين', fn: 'renderAdmin()' });
     if (ME.isHighCommand) fabs.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
-    if (ME.cyber && (ME.cyber.isMember || ME.cyber.isLeader)) fabs.push({ label: '🛡️ الأمن السيبراني', fn: 'renderCyberPanel()' });
+    if (CYBER_PANEL_ENABLED && ME.cyber && (ME.cyber.isMember || ME.cyber.isLeader)) fabs.push({ label: '🛡️ الأمن السيبراني', fn: 'renderCyberPanel()' });
     if (ME.isViolationsOfficer) fabs.push({ label: '⚖️ مسؤول المخالفات', fn: 'renderViolationsOfficerPanel()' });
     if (ME.sectorViolOfficer) fabs.push({ label: '⚖️ مخالفات القطاع', fn: 'renderSectorViolOfficerPanel()' });
     if (ME.canAttView) fabs.push({ label: '🖐️ التحضير', fn: 'renderAttViewPanel()' });
@@ -17392,6 +17243,7 @@ window.addEventListener('pageshow', function (e) { resumeRefresh(true); });
 window.addEventListener('online', function () { resumeRefresh(true); });
 window.addEventListener('focus', function () { resumeRefresh(false); });
 async function pollTick() {
+    if (ME && ME.citizen) { try { czTick(); } catch (x) {} return; }
     if (!ME || ME.blocked || (window.CY && CY.frozen) || (window.UA && UA.frozen) || (window.NG && NG.on)) return;
     if (__pollRunning && Date.now() - __pollStartedAt > 30000) __pollRunning = false;
     if (__pollRunning || document.hidden) return;
@@ -18073,7 +17925,8 @@ function renderAdmin(startTab) {
             <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
             <div class="tab" id="tab-excuses" onclick="adminTab('excuses', this)">🩺 غياب بعذر</div>
             <div class="tab" onclick="adminTab('att', this)">🖐️ لوحة البصمة</div>
-            <div class="tab" id="tab-officers" onclick="adminTab('officers', this)">🎖️ إدارة سلك الضباط</div>
+            \${/* ملاحظة: هنا سلك الضباط (إدارة السلك) — النظام موجود بالكود وتم حذف التاب فقط. لإرجاعه شغّل OFFICERS_CORPS_ENABLED */ ''}
+            \${OFFICERS_CORPS_ENABLED ? '<div class="tab" id="tab-officers" onclick="adminTab(\\'officers\\', this)">🎖️ إدارة سلك الضباط</div>' : ''}
             <div class="tab" id="tab-court" onclick="adminTab('court', this)">⚖️ المحكمة العسكرية</div>
             <div class="tab" id="tab-inv" onclick="adminTab('inv', this)">🔎 التحقيق العسكري</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
@@ -18082,7 +17935,6 @@ function renderAdmin(startTab) {
             <div class="tab" onclick="adminTab('push', this)">📣 الإشعارات</div>
             \${/* ملاحظة: هنا التردد — تم حذف التاب فقط والكود باقي. لإرجاعه حط مكان '' هذا: '<div class="tab" onclick="adminTab(\'freq\', this)">📻 الترددات</div>' */ ''}
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
-            <div class="tab" onclick="renderNewReport()">🧪 تسجيل تقرير جديد مكافحة</div>
         </div>\` : (ME.isAdmin ? \`<div class="tabs"><div class="tab active" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div><div class="tab" id="tab-czlic" onclick="adminTab('czlic', this)">🪪 طلبات الرخص والمركبات</div><div class="tab" id="tab-czcit" onclick="adminTab('czcit', this)">👥 المواطنون</div><div class="tab" id="tab-cphoto" onclick="adminTab('cphoto', this)">🖼️ صور البطاقات</div><div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div></div>\` : '');
     document.getElementById('app').innerHTML = \`
         <div class="card row"><h2>\${ME.isSeniorAdmin ? 'لوحة تحكم كبار المسؤولين' : 'لوحة الإدارة'}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
@@ -18672,6 +18524,27 @@ async function rejectV(id) {
 }
 
 let sectorsCache = { sectors: {}, leadership: {} };
+async function addSectorNew() {
+    var inp = document.getElementById('sec-new-name');
+    var name = inp ? inp.value.trim() : '';
+    if (name.length < 2) return toast('اكتب اسم القطاع');
+    try {
+        await api('/api/senior/sectors/add', { method: 'POST', body: JSON.stringify({ name: name }) });
+        toast('✅ انضاف القطاع');
+        await flSectorsSync();
+        loadSectors();
+    } catch (e) { toast(e.message); }
+}
+async function delSectorKey(key) {
+    var label = SECTOR_LABELS[key] || key;
+    if (!(await confirmModal('متأكد تبي تحذف قطاع «' + label + '»؟ الأعضاء اللي فيه يصيرون بدون قطاع، ورتبهم ونقاطهم ويونتهم تبقى محفوظة.'))) return;
+    try {
+        var r = await api('/api/senior/sectors/' + encodeURIComponent(key) + '/delete', { method: 'POST' });
+        toast('🗑️ انحذف القطاع' + (r.affected ? ' — ' + r.affected + ' عضو صاروا بدون قطاع' : ''));
+        await flSectorsSync();
+        loadSectors();
+    } catch (e) { toast(e.message); }
+}
 async function loadSectors() {
     const box = document.getElementById('admin-content');
     if (!box) return;
@@ -18690,7 +18563,7 @@ async function loadSectors() {
 function renderSectorsBox() {
     const box = document.getElementById('admin-content');
     if (!box) return;
-    const keys = Object.keys(sectorsCache.sectors);
+    const keys = Object.keys(sectorsCache.sectors).filter(function (k) { return k !== 'mp'; });
     const mp = sectorsCache.mpLeadership || {};
     const vos = sectorsCache.violationsOfficers || [];
     const voCard = '<div class=\"card\">' +
@@ -18702,12 +18575,15 @@ function renderSectorsBox() {
         '<div class=\"row\" style=\"gap:6px;margin-top:8px;\"><button class=\"btn sm\" onclick=\"openVOPicker()\">➕ إضافة مسؤول مخالفات</button></div>' +
         '<div style=\"color:var(--muted);font-size:12px;margin-top:6px;\">تقدر تحط أكثر من مسؤول. يقبلون ويرفضون مخالفات وتقارير كل القطاعات. وقادة القطاعات يقبلون مخالفات قطاعهم فقط (ما عدا مخالفاتهم هم).</div>' +
         '<div id=\"picker-vo\"></div></div>';
-    box.innerHTML = voCard + keys.map(key => {
+    const addCard = '<div class=\"card\"><h3>➕ إضافة قطاع</h3>' +
+        '<div style=\"color:var(--muted);font-size:12px;margin:6px 0;\">القطاع الجديد يعتبر قطاع عسكري، وأزراره نفس أزرار الدوريات. تقدر تحذفه، وإذا انحذف الأعضاء اللي فيه يصيرون بدون قطاع ورتبهم ونقاطهم ويونتهم تبقى محفوظة.</div>' +
+        '<div class=\"row\" style=\"gap:6px;\"><input id=\"sec-new-name\" placeholder=\"اسم القطاع الجديد\" maxlength=\"40\"><button class=\"btn sm\" onclick=\"addSectorNew()\">➕ إضافة</button></div></div>';
+    box.innerHTML = addCard + voCard + keys.map(key => {
         const label = sectorsCache.sectors[key];
         const sec = (sectorsCache.leadership && sectorsCache.leadership[key]) || {};
         return \`
         <div class="card">
-            <h3>🪖 \${label}</h3>
+            <div class="row"><h3>🪖 \${label}</h3><button class="btn danger sm" data-k="\${key}" onclick="delSectorKey(this.dataset.k)">🗑️ حذف القطاع</button></div>
             <div class="row" style="margin-top:8px;">
                 <span>القائد: <b style="color:\${sec.commanderName ? '#4ade80' : 'var(--muted)'};">\${sec.commanderName || 'غير معيّن'}</b></span>
                 <div class="row" style="gap:6px;">
@@ -19342,20 +19218,21 @@ function sfExtra(d) {
     var yn = function (b) { return b ? 'نعم' : 'لا'; };
     var out = '';
     // معلومات الحساب
+    // نفس شكل «الحسابات المقبولة»: بيانات الحساب كاملة وكلمة المرور بزر العين
     var acRows = a ? (
-        sfRow('الاسم الكامل', cardEsc(a.fullName || '-')) +
-        sfRow('الإيميل', cardEsc(a.email || '-')) +
-        sfRow('كلمة المرور', a.passwordHidden ? '<span style="color:var(--muted);">مخفية (حساب كبير مسؤولين)</span>' : (a.password ? '<span style="direction:ltr;unicode-bidi:plaintext;">' + cardEsc(a.password) + '</span>' : '—')) +
-        sfRow('العمر', cardEsc(a.age == null ? '-' : a.age)) +
-        sfRow('الجنسية', cardEsc(a.nationality || '-')) +
-        sfRow('حالة الحساب', cardEsc(a.status === 'approved' ? 'مقبول' : a.status === 'rejected' ? 'مرفوض' : 'معلّق')) +
-        sfRow('كبير مسؤولين', yn(a.isSenior)) +
-        sfRow('موقوف', yn(a.suspended)) +
-        sfRow('شرطة عسكرية', yn(a.isMP)) +
-        sfRow('تاريخ التسجيل', sfFull(a.createdAt)) +
-        sfRow('راجعه', cardEsc(a.reviewedByTag || '-'))
-    ) : sfRow('الحساب', '<span style="color:var(--muted);">ما له حساب مسجّل</span>');
-    out += '<div class="id-card" style="margin-top:16px;"><div style="font-size:15px;font-weight:bold;color:var(--gold-soft);margin-bottom:8px;">🔐 معلومات الحساب</div><table>' + acRows + '</table></div>';
+        accRow('الاسم الكامل', a.fullName || '-') +
+        accRow('البريد', a.email || '-') +
+        (a.passwordHidden ? accRow('كلمة المرور', 'مخفية (حساب كبير مسؤولين)') : accPwRow(a.password)) +
+        accRow('العمر', a.age == null ? '-' : a.age) +
+        accRow('الجنسية', a.nationality || '-') +
+        accRow('حالة الحساب', a.status === 'approved' ? 'مقبول' : a.status === 'rejected' ? 'مرفوض' : 'معلّق') +
+        accRow('كبير مسؤولين', yn(a.isSenior)) +
+        accRow('موقوف', yn(a.suspended)) +
+        accRow('شرطة عسكرية', yn(a.isMP)) +
+        accRow('تاريخ التسجيل', sfFull(a.createdAt)) +
+        accRow('راجعه', a.reviewedByTag || '-')
+    ) : accRow('الحساب', 'ما له حساب مسجّل');
+    out += '<div class="id-card" style="margin-top:16px;"><div style="font-size:15px;font-weight:bold;color:var(--gold-soft);margin-bottom:8px;">🔐 معلومات الحساب</div>' + acRows + '</div>';
     // معلومات الملف العسكري
     var warns = (p.warnings || []).length, notesN = (p.notes || []).length;
     out += '<div class="id-card" style="margin-top:16px;"><div style="font-size:15px;font-weight:bold;color:var(--gold-soft);margin-bottom:8px;">🪖 معلومات الملف العسكري</div><table>' +
@@ -21013,7 +20890,43 @@ function mcFit(node) { node.style.fontSize = mcFs(node.textContent, node.classLi
 function mcWarn() { return '<div class="mc-warn">⚠️ تنبيه: هذي البطاقة مخصصة للمحاكاة واللعب فقط، وليست بطاقة حقيقية ولا تمت للواقع بصلة.</div>'; }
 function mcAdminTag(f) { return f.admin ? '<div class="mc-adm">🔴 إداري</div>' : ''; }
 function mcDebug(on) { document.querySelectorAll('.mcard').forEach(function (c) { c.classList.toggle('dbg', on !== false); }); }
+function lxFs(txt, base) {
+    var n = String(txt == null ? '' : txt).length;
+    var f = n <= 12 ? base : n <= 18 ? base * 0.84 : n <= 26 ? base * 0.68 : base * 0.55;
+    return f.toFixed(2) + 'cqw';
+}
+function lxBarcode(num) {
+    var s = String(num), x = 0, r = '';
+    for (var i = 0; i < s.length; i++) {
+        var d = (s.charCodeAt(i) % 10) + 1;
+        r += '<rect x=\"' + x + '\" y=\"0\" width=\"' + (1 + (d % 3)) + '\" height=\"20\"/>';
+        x += 2 + (d % 3) + (d % 2);
+        r += '<rect x=\"' + x + '\" y=\"0\" width=\"1\" height=\"20\"/>';
+        x += 2;
+    }
+    return '<svg viewBox=\"0 0 ' + x + ' 20\" preserveAspectRatio=\"none\" fill=\"#e8c36a\">' + r + '</svg>';
+}
+// البطاقة العسكرية الفخمة (تصميم برمجي بدون صور خلفية)
+function mcFaceLux(f) {
+    var photo = f.avatar ? '<img class=\"lx-photo\" src=\"' + cardEsc(f.avatar) + '\" alt=\"\" onerror=\"this.remove()\">' : '<div class=\"lx-nophoto\">👤</div>';
+    var row = function (top, label, val, fs) { return '<div class=\"lx-f\" style=\"top:' + top + 'cqw;font-size:' + lxFs(val, fs) + ';\"><i>' + label + '</i><b>' + cardEsc(val) + '</b></div>'; };
+    var okNum = /^[0-9]{8}$/.test(String(f.num));
+    var bars = lxBarcode(f.num);
+    var bc = okNum ? '<a class=\"lx-bar\" href=\"/verify-card/' + f.num + '\" target=\"_blank\" rel=\"noopener\" onclick=\"event.stopPropagation()\" aria-label=\"التحقق من البطاقة\">' + bars + '</a>' : '<div class=\"lx-bar\">' + bars + '</div>';
+    return '<div class=\"mc-face lxc\">' +
+        '<div class=\"lx-star\">★</div><div class=\"lx-title\">بطاقة عسكرية</div><div class=\"lx-sub\">MILITARY ID</div><div class=\"lx-chip\"></div>' +
+        row(15.5, 'الاسم', f.name, 3.4) +
+        row(22.5, 'الرتبة', f.rank, 3.1) +
+        row(29.5, 'اليونت', f.unit, 3.1) +
+        row(36.5, 'القطاع', f.sector, 3.1) +
+        photo + bc +
+        '<div class=\"lx-numl\">رقم البطاقة</div><div class=\"lx-num\">' + cardEsc(f.num) + '</div>' +
+        (f.admin ? '<div class=\"mc-adm-in\" style=\"right:6cqw;top:3cqw;\">إداري</div>' : '') +
+        (f.revoked ? '<div class=\"mc-revoked\">ملغاة</div>' : '') +
+    '</div>';
+}
 function mcFace(f) {
+    if (f.key !== 'senior' && f.key !== 'highCommand') return mcFaceLux(f);
     const L = MC_LAYOUT[f.key] || MC_LAYOUT['default'];
     const box = function (a) { return 'left:' + a[0] + '%;top:' + a[1] + '%;width:' + a[2] + '%;height:' + a[3] + '%;'; };
     // idx = رقم الصف (0 الاسم، 1 الرتبة، 2 القطاع، 3 الأخير). L.cols[idx] = [يسار، عرض] خاص بكل صف (لو ما انحطت يستخدم gx/gw)
@@ -21347,7 +21260,7 @@ async function clearAllLogs() {
 }
 let accView_ = 'approved';
 let ACC_LIST = [];
-const ACC_SECTORS = [['', 'بدون قطاع'], ['patrol', 'الدوريات'], ['roadSecurity', 'أمن الطرق'], ['antiDrugs', 'مكافحة المخدرات'], ['cyber', 'الأمن السيبراني'], ['mp', 'الشرطة العسكرية']];
+const ACC_SECTORS = [['', 'بدون قطاع'], ['mp', 'الشرطة العسكرية']];
 function accEsc(t) {
     return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -21980,9 +21893,7 @@ async function loadNotesPage() {
         <div class="card">
             <div style="font-size:13px;color:var(--muted);margin-bottom:8px;">حذف ملاحظات قطاع كامل:</div>
             <div class="row" style="gap:8px;flex-wrap:wrap;">
-                <button class="btn sm danger" onclick="openSectorNotesDelete('patrol')">🗑️ ملاحظات الدوريات</button>
-                <button class="btn sm danger" onclick="openSectorNotesDelete('roadSecurity')">🗑️ ملاحظات أمن الطرق</button>
-                <button class="btn sm danger" onclick="openSectorNotesDelete('antiDrugs')">🗑️ ملاحظات المكافحة</button>
+                \${Object.keys(SECTOR_LABELS).map(function (k) { return '<button class="btn sm danger" data-s="' + k + '" onclick="openSectorNotesDelete(this.dataset.s)">🗑️ ملاحظات ' + SECTOR_LABELS[k] + '</button>'; }).join('')}
             </div>
         </div>\`;
     if (list.length === 0) { box.innerHTML = sectorButtons + '<div class="card center" style="color:var(--muted);">لا توجد ملاحظات مسجلة</div>'; return; }
@@ -22205,7 +22116,7 @@ async function loadSettings() {
             <button class="btn gray" style="margin-top:14px;" onclick="checkBotStatus()">🤖 فحص اتصال البوت</button>
             <button class="btn gray" style="margin-top:14px;" onclick="checkPhotosStatus()">📷 فحص صور المخالفات</button>
         </div>\`;
-    box.insertAdjacentHTML('beforeend', officersLockCardHtml(!!settings.officersLocked));
+    if (OFFICERS_CORPS_ENABLED) box.insertAdjacentHTML('beforeend', officersLockCardHtml(!!settings.officersLocked));
     if (ME && ME.isOwner) {
         let locked = false;
         try { locked = !!(await api('/api/owner/saved-login-lock')).locked; } catch (e) {}
@@ -22310,6 +22221,7 @@ async function saveSettings() {
     catch (e) { toast(e.message); }
 }
 /* ============================ 🎖️ سلك الضباط ============================ */
+/* ملاحظة: هذا هو نظام «سلك الضباط» (واجهة المتقدم + إدارة السلك + المدرب). الأزرار مخفية حالياً — لإرجاعه شغّل OFFICERS_CORPS_ENABLED في أول السكربت. */
 var OFF = { my: null, locked: false, questions: [], offset: 0, sig: '', tick: null };
 var OFFA = { tab: 'apps', sig: '', timer: null, data: null, checks: {} };
 var VC = null;
@@ -25679,6 +25591,19 @@ function flHideCyberPO() {
 }
 
 
+/* حارس: المواطن ما يدخل صفحات العسكر أبداً */
+(function () {
+    ['renderDashboard', 'renderAdmin', 'renderCard', 'renderMinePage', 'renderLeavePage', 'renderExcusePage', 'renderCertPage',
+     'renderNewViolation', 'renderNewReport', 'renderHighCommandPanel', 'renderCyberPanel', 'renderSectorPanel', 'renderMPPanel',
+     'renderOfficerPage', 'renderTrainerPage'].forEach(function (n) {
+        var f = window[n];
+        if (typeof f !== 'function') return;
+        window[n] = function () {
+            if (ME && ME.citizen) { try { czGo((CZ && CZ.tab) || 'home'); } catch (x) {} return; }
+            return f.apply(this, arguments);
+        };
+    });
+})();
 init();
 </script>
 </body>
@@ -25702,6 +25627,5 @@ process.on("uncaughtException", (err) => {
 app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`🚀 ${CONFIG.SITE_NAME} server running on port ${CONFIG.PORT}`);
     bankWakeSoft(); // فلاش قام → صحّي البنك معه
-    if (global.__FLASH_RELEASE__) setTimeout(() => { try { require("fs").unlinkSync(require("path").join(__dirname, "flash_boot.json")); } catch (e) {} }, 90000).unref();
 });
 
