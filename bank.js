@@ -17,7 +17,7 @@ app.use((req, res, next) => {
 
 // ── إعدادات ──────────────────────────────────────────────────────────────
 // عنوان موقع فلاش (تطبيق الويب الأساسي) — يقدر ينغيّر من متغير البيئة FLASH_URL على Render
-const FLASH_API = String(process.env.FLASH_URL || '').replace(/\/+$/, '');
+const FLASH_API = String(process.env.FLASH_URL || 'https://flash-gpeb.onrender.com').replace(/\/+$/, '');
 
 // مفتاح سرّي مشترك مع فلاش (لازم نفس القيمة بالضبط في INTERNAL_API_KEY على موقع فلاش وعلى البنك)
 // يُستخدم لتوقيع رابط الدخول من فلاش، ولتأمين الطلبات بين الموقعين. بدونه الربط يتوقف (أمان).
@@ -40,7 +40,6 @@ app.get('/to-flash', (req, res) => {
 });
 async function flashGet(path) {
     if (!INTERNAL_API_KEY) throw new Error('INTERNAL_API_KEY غير مضبوط على خدمة البنك');
-    if (!FLASH_API) throw new Error('FLASH_URL غير مضبوط على خدمة البنك (رابط فلاش المواطنين)');
     const r = await fetch(FLASH_API + path, { headers: internalHeaders() });
     const txt = await r.text();
     let data;
@@ -343,7 +342,7 @@ function periodToMs(value, unit) {
 async function payMilitarySalaries(list, settings, advance) {
     let paidCount = 0, totalPaid = 0, shortCount = 0;
     const tag = advance ? ' (دفعة مسبقة)' : '';
-    // الرواتب تنسحب من حساب التمويل (يحدده المالك) وتنزل للمواطنين — مو من بنك فلاش
+    // الرواتب تنسحب من حساب التمويل (يحدده المالك) وتنزل للعساكر — مو من بنك فلاش
     const fund = settings.fundAccount ? await Account.findOne({ accountNumber: settings.fundAccount }) : null;
     if (!fund) return { paidCount: 0, totalPaid: 0, shortCount: 0, noFund: true };
     let stop = false;
@@ -387,7 +386,7 @@ async function payMilitarySalaries(list, settings, advance) {
     return { paidCount, totalPaid, shortCount };
 }
 
-// تنفيذ عملية صرف رواتب المواطنين: يجيب وظيفة كل مواطن من موقع فلاش
+// تنفيذ عملية صرف رواتب المواطنين: يجيب رتبة كل عسكري من موقع فلاش
 // ويودع الراتب المحدد لرتبته في حسابه البنكي المسجل
 async function runMilitarySalaryPayout() {
     const settings = await getMilitarySalarySettings();
@@ -985,7 +984,7 @@ async function pfOpen(uid) {
     var tx = function (t) { return t ? (t.amount || 0).toLocaleString() + ' $ — ' + spDate(t.createdAt) + (t.note ? ' — ' + t.note : '') : 'لا يوجد'; };
     var h = '<div class="card"><h2>🏦 الحساب البنكي الآن</h2>' + row('الاسم', a.discordTag) + row('رقم الحساب', a.accountNumber) + row('الرصيد الجاري', (a.balance || 0).toLocaleString() + ' $') + row('رصيد التوفير', (a.savingsBalance || 0).toLocaleString() + ' $') + row('الحالة', a.isFrozen ? '🔒 مجمّد' : '✅ نشط') + row('محظور من الدعم', a.supportBanned ? 'نعم' : 'لا') + row('تاريخ الفتح', spDate(a.createdAt)) +
         '<button class="btn ' + (a.isFrozen ? 'btn-green' : 'btn-yellow') + '" style="margin-top:8px" onclick="pfFreeze(\'' + a._id + '\',\'' + uid + '\')">' + (a.isFrozen ? '🔓 فك تجميد الحساب' : '🔒 تجميد الحساب') + '</button></div>';
-    h += '<div class="card"><h2>⚡ حسابه في فلاش الآن</h2>' + (f ? row('الاسم', f.name) + row('النوع', f.sector) + row('الوظيفة / الرتبة', f.rank) + row('رقم الهوية المدنية', f.cardNumber) + row('البطاقة', f.revoked ? '🚫 ملغاة' : '✅ سارية') + row('الحالة', f.blocked ? '⛔ موقوف' : 'نشط') : '<p style="color:#64748b">تعذر جلب بيانات فلاش (أو ما له ملف).</p>') + '</div>';
+    h += '<div class="card"><h2>⚡ حسابه في فلاش الآن</h2>' + (f ? row('الاسم', f.name) + row('الوظيفة / الرتبة', f.rank) + row('اليونت', f.unit) + row('القطاع', f.sector) + row('النقاط', f.points) + row('رقم الهوية / البطاقة', f.cardNumber) + row('البطاقة', f.revoked ? '🚫 ملغاة' : '✅ سارية') + row('الحالة', f.blocked ? '⛔ موقوف' : 'نشط') : '<p style="color:#64748b">تعذر جلب بيانات فلاش (أو ما له ملف).</p>') + '</div>';
     h += '<div class="card"><h2>💳 بطاقاته</h2>' + (d.cards.length ? d.cards.map(function (c) {
         return (c.cardNumber ? bkCardHtml(c, { showCvv: false }) : '') + '<div style="margin:8px 0 14px">' + row('الحالة', { pending: '⏳ قيد المراجعة', approved: '✅ مفعّلة', rejected: '❌ مرفوضة', disabled: '🚫 معطّلة' }[c.status] || c.status) + row('الانتهاء', c.cardExpiry ? spDate(c.cardExpiry) : '—') + row('التجميد', c.cardFrozen ? 'مجمّدة' : 'لا') + row('الرقم السري', c.pinSet ? 'معيّن' : 'لم يُعيَّن') + row('تاريخ الطلب', spDate(c.requestedAt)) +
             (c.pinSet ? '<button class="btn btn-blue" style="margin-top:6px;padding:5px 10px" onclick="ccShowPin(\'' + c._id + '\')">👁️ عرض الرقم السري</button>' : '') + '</div>';
@@ -1352,7 +1351,7 @@ async function bk2LoanAct(id, action) {
         sb.insertAdjacentElement('afterend', box);
         if (window.ownerPower) {
             var d = await bk2Json('/api/owner/salary-funding');
-            box.innerHTML = '<b style="color:#fde047">💰 حساب تمويل الرواتب (تنسحب منه الرواتب وتنزل للمواطنين)</b>' +
+            box.innerHTML = '<b style="color:#fde047">💰 حساب تمويل الرواتب (تنسحب منه الرواتب وتنزل للعساكر)</b>' +
                 '<p style="color:#94a3b8;font-size:.82rem;margin:6px 0">' + (d.fundAccount ? ('الحساب: <b>' + bk2Esc(d.name) + '</b> — ' + bk2Esc(d.fundAccount) + ' — الرصيد: <b>' + (d.balance || 0).toLocaleString() + ' $</b>') : '<span style="color:#fca5a5">ما تم تحديد حساب — الرواتب ما راح تنصرف لين تحدده.</span>') + '</p>' +
                 '<div style="display:flex;gap:6px;flex-wrap:wrap"><input id="ms-fund-input" placeholder="رقم الحساب (6 أرقام)" maxlength="6" inputmode="numeric" value="' + bk2Esc(d.fundAccount || '') + '" style="width:170px;margin-bottom:0">' +
                 '<button class="btn btn-green" onclick="bk2SaveFund()">💾 حفظ</button>' + (d.fundAccount ? '<button class="btn btn-red" onclick="bk2SaveFund(true)">إلغاء</button>' : '') + '</div><div id="ms-fund-msg" style="margin-top:6px"></div>';
@@ -2345,7 +2344,7 @@ app.put('/api/notifications/:id/read', checkMaintenance, async (req, res) => {
     } catch (e) { res.json({ success: false }); }
 });
 
-// ── تمويل الرواتب: حساب يحدده المالك فقط، الرواتب تنسحب منه وتنزل للمواطنين ──
+// ── تمويل الرواتب: حساب يحدده المالك فقط، الرواتب تنسحب منه وتنزل للعساكر ──
 app.get('/api/owner/salary-funding', ownerOnly, async (req, res) => {
     try {
         const s = await getMilitarySalarySettings();
@@ -2400,7 +2399,7 @@ app.post('/api/superadmin/cards/rejected-clear', isBankSuperAdmin, async (req, r
 app.get('/api/superadmin/military-salary/ranks', isBankSuperAdmin, async (req, res) => {
     try {
         const data = await flashGet('/api/bank/ranks');
-        if (!data.success) return res.json({ success: false, msg: "تعذر جلب الوظائف من موقع فلاش" });
+        if (!data.success) return res.json({ success: false, msg: "تعذر جلب الرتب من موقع فلاش" });
 
         const settings = await getMilitarySalarySettings();
         const salaries = {};
@@ -2453,7 +2452,7 @@ app.post('/api/superadmin/military-salary/toggle', isBankSuperAdmin, async (req,
 
         if (newActive) {
             if (!settings.ranksSalaries || settings.ranksSalaries.size === 0) {
-                return res.json({ success: false, msg: "يجب تحديد رواتب الوظائف وحفظها أولاً قبل التفعيل" });
+                return res.json({ success: false, msg: "يجب تحديد رواتب الرتب وحفظها أولاً قبل التفعيل" });
             }
             const nextPayoutAt = new Date(Date.now() + periodToMs(settings.periodValue, settings.periodUnit));
             await MilitarySalarySettings.updateOne({}, { isActive: true, nextPayoutAt });
@@ -2476,7 +2475,7 @@ app.post('/api/superadmin/military-salary/run-now', isBankSuperAdmin, async (req
     res.json(result);
 });
 
-// قائمة العساكر المستحقين (عندهم حساب + راتب لرتبتهم) لاختيار أشخاص محددين للصرف المسبق
+// قائمة المواطنين المستحقين (عندهم حساب + راتب لوظيفتهم) لاختيار أشخاص محددين للصرف المسبق
 app.get('/api/superadmin/military-salary/personnel', isBankSuperAdmin, async (req, res) => {
     try {
         const settings = await getMilitarySalarySettings();
@@ -2545,6 +2544,7 @@ app.post('/api/account/card/request', checkMaintenance, async (req, res) => {
         const mUnit = String(militaryUnit || '').trim().slice(0, 60);
         const num = String(militaryCardNumber || '').trim().slice(0, 20);
         const reason = String(requestReason || '').trim().slice(0, 500);
+        if (!mSector || !mRank || !mUnit) return res.json({ success: false, msg: "يجب تعبئة القطاع والرتبة واليونت" });
         if (!reason) return res.json({ success: false, msg: "اكتب سبب طلب البطاقة" });
         if (!pledge) return res.json({ success: false, msg: "يجب الموافقة على التعهد" });
 
@@ -2557,13 +2557,12 @@ app.post('/api/account/card/request', checkMaintenance, async (req, res) => {
             return res.json({ success: false, msg: "تعذر التحقق من هويتك من فلاش، جرّب بعد شوي" });
         }
 
-        // المواطن لازم يكتب رقم هويته المدنية الصحيح (4 أو 5 أرقام). العسكري ما له هوية مدنية فيتحقق بحسابه فقط.
         let autoReject = null;
-        if (!info.found) autoReject = 'لا يوجد حساب لك في فلاش';
-        else if (info.kind !== 'military' && !num) autoReject = 'لم تُدخل رقم هويتك المدنية';
-        else if (info.kind !== 'military' && (!/^[0-9]{4,5}$/.test(num) || num !== String(info.cardNumber))) autoReject = 'رقم الهوية المدنية غير صحيح أو ليست هويتك';
-        else if (info.revoked) autoReject = 'حسابك موقوف في فلاش';
-        else if (info.blocked) autoReject = 'حسابك موقوف في فلاش';
+        if (!info.found) autoReject = 'لا توجد هوية لك في فلاش';
+        else if (!num) autoReject = 'لم تُدخل رقم هويتك المدنية';
+        else if (!/^[0-9]{4,8}$/.test(num) || num !== String(info.cardNumber)) autoReject = 'رقم الهوية/البطاقة غير صحيح أو ليس لك';
+        else if (info.revoked) autoReject = 'بطاقتك العسكرية ملغاة';
+        else if (info.blocked) autoReject = 'حسابك في فلاش موقوف';
 
         await CardRequest.create({
             discord: req.user.id,
@@ -3300,7 +3299,7 @@ const SUPPORT_FAQ = [
     { id: 'card', keys: ['بطاقه', 'بطاقتي', 'البطاقه', 'طلب بطاقه', 'فيزا', 'تجديد البطاقه', 'تجديد'], a: 'طلب البطاقة من «💳 بطاقاتي»: اكتب رقم هويتك المدنية ووافق على التعهد، وتنراجع من الإدارة. بعد القبول تحدد رقمك السري. البطاقة المنتهية تقدر تجددها من نفس الصفحة (قد يكون فيه رسوم).' },
     { id: 'frozen', keys: ['مجمد', 'مجمّد', 'تجميد', 'حسابي مجمد', 'فريز'], a: 'تجميد الحساب أو البطاقة قرار من الإدارة. إذا تبي تعرف السبب أو تعترض اضغط «تحدث مع عضو حقيقي».', human: true },
     { id: 'fine', keys: ['مخالفه', 'مخالفة', 'سداد مخالفه', 'خصم', 'خصموا'], a: 'سداد المخالفات يتم من موقع فلاش بالبطاقة البنكية (رقم البطاقة + الرقم السري) ويُخصم من رصيدك ويوصلك إشعار. إذا انخصم مبلغ غلط اضغط «تحدث مع عضو حقيقي».', human: true },
-    { id: 'balance', keys: ['رصيدي', 'الرصيد', 'ما نزل', 'ما انضاف', 'راتب', 'راتبي'], a: 'رصيدك وحركاتك تشوفها في الرئيسية و«📜 كشف حساب». رواتب المواطنين تنزل تلقائياً حسب جدول الوظائف. إذا ناقص شي اضغط «تحدث مع عضو حقيقي».', human: true },
+    { id: 'balance', keys: ['رصيدي', 'الرصيد', 'ما نزل', 'ما انضاف', 'راتب', 'راتبي'], a: 'رصيدك وحركاتك تشوفها في الرئيسية و«📜 كشف حساب». رواتب المواطنين تنزل تلقائياً حسب وظيفتك. إذا ناقص شي اضغط «تحدث مع عضو حقيقي».', human: true },
     { id: 'complaint', keys: ['شكوى', 'اشتكي', 'ظلم', 'تعدي', 'سرقه', 'احتيال'], human: true, a: 'نأسف لهذا الشي، الشكاوى تتابعها الإدارة مباشرة. اضغط «🧑‍💼 تحدث مع عضو حقيقي» ووضّح القصة وأرفق أي إثبات.' }
 ];
 function supFaqReply(t) {
@@ -3663,7 +3662,7 @@ async function supRows(cat, uid, only) {
     } else if (cat === 'flash') {
         let d = null; try { d = await flashGet('/api/bank/member-card?uid=' + encodeURIComponent(uid)); } catch (e) {}
         if (!d || !d.success || !d.found) return [R('fl.name', 'فلاش', 'غير متاح')].filter(r => !only || only.has(r.k));
-        rows.push(R('fl.name', 'الاسم المسجّل', d.name), R('fl.sector', 'النوع', d.sector), R('fl.rank', 'الوظيفة / الرتبة', d.rank), R('fl.card', 'رقم الهوية المدنية', d.cardNumber));
+        rows.push(R('fl.name', 'الاسم المسجّل', d.name), R('fl.rank', 'الوظيفة / الرتبة', d.rank), R('fl.unit', 'اليونت', d.unit), R('fl.sector', 'القطاع', d.sector), R('fl.card', 'رقم الهوية / البطاقة', d.cardNumber));
     }
     return rows.filter(r => !only || only.has(r.k));
 }
@@ -4217,8 +4216,23 @@ app.use(async (req, res) => {
                 <h2>📤 تقديم طلب بطاقة جديدة</h2>
                 <p style="color:#94a3b8; font-size:0.85rem; margin-bottom:1rem;">يُرسل الطلب لمراجعة الإدارة ولا يُفعَّل تلقائياً</p>
                 <div id="card-req-msg"></div>
-                <label>🪪 هويتك المدنية (رقم هويتك من فلاش — للعسكر اتركه فاضي):</label>
-                <input id="card-mil-number" inputmode="numeric" maxlength="5" autocomplete="off" placeholder="ضع رقم هويتك المدنية (4 أو 5 أرقام)" />
+                <label>🪪 رقم هويتك المدنية (من فلاش):</label>
+                <input id="card-mil-number" inputmode="numeric" maxlength="8" autocomplete="off" placeholder="ضع رقم هويتك المدنية" />
+                <div style="display:none;">
+                <label>🛡️ قطاعك العسكري:</label>
+                <select id="card-mil-sector">
+                    <option value="">— اختر القطاع —</option>
+                    <option value="الدوريات">الدوريات</option>
+                    <option value="أمن الطرق">أمن الطرق</option>
+                    <option value="مكافحة المخدرات">مكافحة المخدرات</option>
+                    <option value="الأمن السيبراني">الأمن السيبراني</option>
+                    <option value="الشرطة العسكرية">الشرطة العسكرية</option>
+                </select>
+                <label>🎖️ رتبتك العسكرية:</label>
+                <select id="card-mil-rank"><option value="">— اختر الرتبة —</option></select>
+                <label>🧩 يونتك العسكري:</label>
+                <input id="card-mil-unit" autocomplete="off" placeholder="اكتب اسم اليونت" />
+                </div>
                 <label>سبب طلب البطاقة:</label>
                 <textarea id="card-reason" rows="3" maxlength="500" placeholder="اشرح سبب حاجتك للبطاقة..."></textarea>
                 <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:1rem;">
@@ -4445,7 +4459,7 @@ app.use(async (req, res) => {
 
             <div id="atab-military-salary-section" style="display:none;">
                 <div class="card card-blue">
-                    <h2>💼 رواتب المواطنين (ربط مع موقع فلاش)</h2>
+                    <h2>🎖️ رواتب المواطنين (ربط مع موقع فلاش)</h2>
                     <p style="color:#94a3b8; font-size:0.85rem; margin-bottom:1rem;">حدد كل كم مدة تنزل رواتب المواطنين، وحدد راتب كل وظيفة. الراتب ينزل تلقائياً على الحساب البنكي المسجل لكل مواطن حسب وظيفته في موقع فلاش.</p>
 
                     <div id="military-salary-status" style="margin-bottom:14px;"></div>
@@ -5628,12 +5642,15 @@ app.use(async (req, res) => {
 
         async function submitCardRequest() {
             const num = document.getElementById('card-mil-number').value.trim();
-            const sector = '', rank = '', unit = '';
+            const sector = 'مواطن';
+            const rank = 'مواطن';
+            const unit = 'مواطن';
             const reason = document.getElementById('card-reason').value.trim();
             const pledge = document.getElementById('card-pledge').checked;
+            if (!sector || !rank || !unit) return showMsg('card-req-msg', 'عبّي القطاع والرتبة واليونت', 'danger');
             if (!reason) return showMsg('card-req-msg', 'اكتب سبب طلب البطاقة', 'danger');
             if (!pledge) return showMsg('card-req-msg', 'يجب الموافقة على التعهد', 'danger');
-            showMsg('card-req-msg', 'جاري التحقق من هويتك المدنية...', 'info');
+            showMsg('card-req-msg', 'جاري التحقق من هويتك...', 'info');
             const res = await fetch('/api/account/card/request', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ militaryCardNumber: num, militarySector: sector, militaryRank: rank, militaryUnit: unit, requestReason: reason, pledge: pledge })
@@ -5641,7 +5658,7 @@ app.use(async (req, res) => {
             const data = await res.json();
             showMsg('card-req-msg', (data.success ? '✅ ' : '❌ ') + data.msg, data.success ? 'success' : 'danger');
             loadMyCards();
-            if (data.success) { ['card-mil-number','card-reason'].forEach(function(id){ document.getElementById(id).value = ''; }); document.getElementById('card-pledge').checked = false; }
+            if (data.success) { ['card-mil-number','card-mil-unit','card-reason'].forEach(function(id){ document.getElementById(id).value = ''; }); document.getElementById('card-mil-sector').value = ''; document.getElementById('card-mil-rank').value = ''; csRefresh('card-mil-sector'); csRefresh('card-mil-rank'); document.getElementById('card-pledge').checked = false; }
         }
 
         // ─── دوال أدمن البطاقات ────────────────────────────────────────────────
@@ -5675,8 +5692,9 @@ app.use(async (req, res) => {
                     <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:8px;">
                         <div>
                             <b>\${c.discordTag}</b> <span style="color:#64748b; font-size:0.8rem;">\${c.discord}</span>
+                            <p style="margin-top:5px; color:#94a3b8; font-size:0.85rem;">🎖️ الرتبة: \${c.militaryRank || '—'} | 🛡️ القطاع: \${c.militarySector || '—'} | 🧩 اليونت: \${c.militaryUnit || '—'}</p>
                             \${(c.flashRank && (c.flashRank !== c.militaryRank || c.flashSector !== c.militarySector)) ? ('<p style="color:#fbbf24; font-size:0.8rem;">⚠️ المسجّل في فلاش: ' + c.flashRank + ' — ' + (c.flashSector || '—') + ' — ' + (c.flashUnit || '—') + '</p>') : ''}
-                            <p style="color:#4ade80; font-size:0.85rem;">🪪 الهوية المدنية: \${c.militaryCardNumber || '—'}</p>
+                            <p style="color:#4ade80; font-size:0.85rem;">🪪 رقم الهوية: \${c.militaryCardNumber || '—'}</p>
                             <p style="color:#94a3b8; font-size:0.83rem;">السبب: \${c.requestReason}</p>
                             <p style="color:#64748b; font-size:0.78rem;">\${new Date(c.requestedAt).toLocaleString('ar-SA')}</p>
                         </div>
@@ -5923,10 +5941,10 @@ app.use(async (req, res) => {
             let data;
             try { const r = await fetch('/api/superadmin/military-salary/personnel'); data = await r.json(); } catch (e) { data = null; }
             if (!data || !data.success) { uiToast('❌ ' + ((data && data.msg) || 'تعذر جلب المواطنين'), 'danger'); return; }
-            if (!data.list.length) { uiToast('ما فيه مواطنين مستحقين (لازم يكون لهم حساب ووظيفة براتب)', 'warning'); return; }
+            if (!data.list.length) { uiToast('ما فيه عساكر مستحقين (لازم يكون لهم حساب وراتب لرتبتهم)', 'warning'); return; }
             const s = uiShell('success', '🎯 اختر من يجيه الراتب مسبق');
             const search = document.createElement('input');
-            search.type = 'text'; search.placeholder = '🔍 ابحث بالاسم أو الوظيفة...';
+            search.type = 'text'; search.placeholder = '🔍 ابحث بالاسم أو الرتبة...';
             s.box.appendChild(search);
             const listEl = uiEl('div', 'ms-pick-list');
             s.box.appendChild(listEl);
