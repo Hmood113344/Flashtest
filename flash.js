@@ -1969,6 +1969,7 @@ const CitizenSchema = new mongoose.Schema({
     answers: { type: Object, default: {} },
     licenseStatus: { type: String, enum: ["none", "pending", "approved", "revoked"], default: "none" },
     licenseNo: { type: String, default: null }, licenseAt: { type: Date, default: null },
+    cardRevoked: { type: Boolean, default: false, index: true }, cardRevokedAt: { type: Date, default: null }, cardRevokedByName: { type: String, default: null }, cardRevokedReason: { type: String, default: null },
     vehicles: [{ _id: false, name: String, key: String, photoId: { type: String, default: null }, addedAt: { type: Date, default: Date.now } }],
     createdAt: { type: Date, default: Date.now },
 });
@@ -2078,7 +2079,7 @@ async function czVisibleFines(uid) {
 function czView(c) {
     return {
         uid: c.uid, fullName: c.fullName, age: c.age, nationality: c.nationality, civilId: c.civilId || null,
-        jobName: c.jobName || null, licenseStatus: c.licenseStatus || "none", licenseNo: c.licenseNo || null, licenseAt: c.licenseAt || null,
+        jobName: c.jobName || null, cardRevoked: !!c.cardRevoked, licenseStatus: c.licenseStatus || "none", licenseNo: c.licenseNo || null, licenseAt: c.licenseAt || null,
         vehicles: (c.vehicles || []).map(v => ({ name: v.name, photoId: v.photoId || null, addedAt: v.addedAt })), createdAt: c.createdAt,
     };
 }
@@ -2395,7 +2396,8 @@ app.get("/api/cz/lookup", ensureNotCitizen, async (req, res) => {
     });
     app.post("/api/dev/login-as/:uid", async (req, res, next) => {
         if (!req.user || !isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
-        const t = await Account.findOne({ uid: String(req.params.uid), status: "approved" }, { uid: 1, isOwner: 1 }).lean();
+        let t = await Account.findOne({ uid: String(req.params.uid), status: "approved" }, { uid: 1, isOwner: 1 }).lean();
+        if (!t) t = await Citizen.findOne({ uid: String(req.params.uid), status: "approved" }, { uid: 1 }).lean();
         if (!t) return res.status(404).json({ error: "الحساب غير موجود أو غير مقبول" });
         if (t.isOwner) return res.status(400).json({ error: "هذا حساب المالك" });
         devLogin(req, res, next, t.uid, true, !!(req.body && req.body.silent));
@@ -3771,6 +3773,25 @@ app.get("/card-qr/:num", (req, res) => {
     if (!svg) return res.status(404).end();
     res.set("Cache-Control", "public, max-age=86400").type("image/svg+xml").send(svg);
 });
+function cardVerifyPage(o, assets) {
+    assets = assets || {};
+    const presName = assets.presName || CERT_DEFAULTS.presName, vpName = assets.vpName || CERT_DEFAULTS.vpName;
+    const rows = (o.rows || []).map(r => '<div class="r"><span>' + certEsc(r[0]) + '</span><b>' + certEsc(r[1]) + '</b></div>').join("");
+    const sigBox = (stampImg, stampSvg, sigImg, sigSvg, nm, tt) => '<div class="sig"><div class="box"><div class="st">' + (stampImg ? certAssetImg(stampImg, 90) : stampSvg) + '</div>' + (sigImg ? certAssetImg(sigImg, 62) : sigSvg) + '</div><div class="nm">' + certEsc(nm) + '</div><div class="tt">' + certEsc(tt) + '</div></div>';
+    const approval = '<div class="ap"><div class="apt">✦ اعتماد القيادة العليا ✦</div><div class="aps">تم اعتماد هذا السجل إلكترونياً وختمه من القيادة العليا</div><div class="sigs">' +
+        sigBox(assets.vpStamp, certStampSvg(CERT_DEFAULTS.vpTitle, "#b91c1c"), assets.vpSig, certSigSvg(2), vpName, CERT_DEFAULTS.vpTitle) +
+        sigBox(assets.presStamp, certStampSvg(CERT_DEFAULTS.presTitle, "#1d3a8a"), assets.presSig, certSigSvg(1), presName, CERT_DEFAULTS.presTitle) + '</div></div>';
+    return '<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>' + certEsc(o.kind) + ' — التحقق</title>' +
+        '<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;800&display=swap" rel="stylesheet"><style>*{box-sizing:border-box}body{margin:0;background:#0b1f4a;font-family:Tajawal,Cairo,"Segoe UI",Tahoma,Arial,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}' +
+        '.c{background:#fffdf7;border-radius:16px;max-width:460px;width:100%;overflow:hidden;box-shadow:0 10px 40px rgba(0,0,0,.4);outline:2px solid #c9a227;outline-offset:-8px}.org{text-align:center;background:#0b1f4a;color:#fde68a;padding:10px;font-weight:800;font-size:15px;letter-spacing:.5px}.org small{display:block;color:#cbd5e1;font-weight:400;font-size:11px}' +
+        '.h{background:' + o.color + ';color:#fff;text-align:center;padding:20px 14px}.h .k{font-size:13px;opacity:.9}.h .i{font-size:44px}.h .s{font-size:24px;font-weight:800;margin-top:2px}' +
+        '.m{padding:14px 18px;color:#374151;line-height:1.8;text-align:center;font-size:15px;border-bottom:1px solid #eee}.r{display:flex;justify-content:space-between;gap:10px;padding:10px 18px;border-bottom:1px solid #f1f1f1;font-size:15px}.r span{color:#6b7280}.r b{color:#0b1f4a;text-align:left}' +
+        '.ap{padding:16px 12px 6px;border-top:2px solid #c9a227;margin-top:6px;background:linear-gradient(#fffdf7,#f8f0cf)}.apt{text-align:center;font-weight:800;color:#8a6d0b;font-size:17px}.aps{text-align:center;color:#6b7280;font-size:11px;margin:2px 0 4px}' +
+        '.sigs{display:flex;gap:6px;justify-content:space-around;align-items:flex-end}.sig{text-align:center;flex:1}.sig .box{height:108px;display:flex;align-items:center;justify-content:center;position:relative}.sig .box .st{position:absolute;opacity:.88}.sig .nm{font-weight:800;color:#0b1f4a;font-size:14px;border-top:1px solid #c9a227;padding-top:4px;margin:0 10px}.sig .tt{font-size:12px;color:#6b7280}' +
+        '.f{text-align:center;color:#9ca3af;font-size:12px;padding:12px}</style></head><body>' +
+        '<div class="c"><div class="org">' + certEsc(CONFIG.SITE_NAME) + '<small>الإدارة العامة للسيرفر — نظام التحقق الرسمي</small></div>' +
+        '<div class="h"><div class="k">' + certEsc(o.kind) + '</div><div class="i">' + o.icon + '</div><div class="s">' + certEsc(o.status) + '</div></div><div class="m">' + certEsc(o.msg) + '</div>' + rows + approval + VERIFY_BACK_BTN + '<div class="f">' + certEsc(CONFIG.SITE_NAME) + ' — نظام التحقق من البطاقات</div></div></body></html>';
+}
 app.get("/verify-card/:num", async (req, res) => {
     const n = String(req.params.num || "");
     let p = null, acc = null;
@@ -3785,13 +3806,26 @@ app.get("/verify-card/:num", async (req, res) => {
     else if (p.isBlocked || (acc && acc.suspended)) { status = "موقوفة مؤقتاً"; color = "#b45309"; icon = "⚠️"; msg = "صاحب هذي البطاقة موقوف حالياً."; }
     else { status = "سارية وصحيحة"; color = "#15803d"; icon = "✅"; msg = "هذي بطاقة عسكرية صادرة رسمياً من " + CONFIG.SITE_NAME + "."; }
     const sec = p ? ((acc && acc.sector) || p.sector || null) : null;
-    const row = (k, v) => '<div class="r"><span>' + k + '</span><b>' + certEsc(v) + '</b></div>';
-    const details = p ? row("الاسم", p.registeredName) + row("الرتبة", p.rank || "-") + row("القطاع", sec ? (CONFIG.SECTORS[sec] || sec) : (p.unit || "-")) + row("رقم البطاقة", p.cardNumber) : "";
-    res.set("Cache-Control", "no-store").type("html").send('<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>التحقق من البطاقة</title>' +
-        '<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;800&display=swap" rel="stylesheet"><style>*{box-sizing:border-box}body{margin:0;background:#0b1f4a;font-family:Tajawal,Cairo,"Segoe UI",Tahoma,Arial,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}' +
-        '.c{background:#fffdf7;border-radius:16px;max-width:460px;width:100%;overflow:hidden;box-shadow:0 10px 40px rgba(0,0,0,.4)}.h{background:' + color + ';color:#fff;text-align:center;padding:22px 14px}.h .i{font-size:46px}.h .s{font-size:24px;font-weight:800;margin-top:4px}' +
-        '.m{padding:14px 18px;color:#374151;line-height:1.8;text-align:center;font-size:15px;border-bottom:1px solid #eee}.r{display:flex;justify-content:space-between;gap:10px;padding:10px 18px;border-bottom:1px solid #f1f1f1;font-size:15px}.r span{color:#6b7280}.r b{color:#0b1f4a;text-align:left}.f{text-align:center;color:#9ca3af;font-size:12px;padding:12px}</style></head><body>' +
-        '<div class="c"><div class="h"><div class="i">' + icon + '</div><div class="s">' + status + '</div></div><div class="m">' + certEsc(msg) + '</div>' + details + VERIFY_BACK_BTN + '<div class="f">' + certEsc(CONFIG.SITE_NAME) + ' — نظام التحقق من البطاقات</div></div></body></html>');
+    const rows = p ? [["الاسم", p.registeredName], ["الرتبة", p.rank || "-"], ["اليونت", p.unit || "-"], ["القطاع", sec ? (CONFIG.SECTORS[sec] || sec) : (p.unit || "-")], ["رقم البطاقة", p.cardNumber], ["حالة البطاقة", status]] : [];
+    if (p && p.cardRevoked) rows.push(["تاريخ الإلغاء", p.cardRevokedAt ? certDate(p.cardRevokedAt) : "-"]);
+    if (p) rows.push(["تاريخ التحقق", certDate(new Date())]);
+    res.set("Cache-Control", "no-store").type("html").send(cardVerifyPage({ kind: "البطاقة العسكرية", status, color, icon, msg, rows }, await certAssetsNow()));
+});
+// ===================== 🪪 التحقق من الهوية المدنية (باركود هوية المواطن) =====================
+app.get("/verify-id/:num", async (req, res) => {
+    const n = String(req.params.num || "");
+    let c = null;
+    try { c = /^[0-9]{4,5}$/.test(n) ? await Citizen.findOne({ civilId: n }).lean() : null; } catch (e) {}
+    let status, color, icon, msg;
+    if (!c || !c.fullName) { c = null; status = "غير موجودة"; color = "#b91c1c"; icon = "❌"; msg = "لا توجد هوية بهذا الرقم في سجلات " + CONFIG.SITE_NAME + ". احذر من الهويات المزوّرة."; }
+    else if (c.cardRevoked) { status = "ملغاة"; color = "#b45309"; icon = "⚠️"; msg = "هذي الهوية كانت صادرة ثم تم إلغاؤها، ولا يُعتدّ بها."; }
+    else if (c.status === "suspended") { status = "موقوفة مؤقتاً"; color = "#b45309"; icon = "⚠️"; msg = "صاحب هذي الهوية موقوف حالياً."; }
+    else { status = "سارية وصحيحة"; color = "#15803d"; icon = "✅"; msg = "هذي هوية مدنية صادرة رسمياً من " + CONFIG.SITE_NAME + "."; }
+    const lic = c ? (c.licenseStatus === "approved" ? "معتمدة" : c.licenseStatus === "revoked" ? "مسحوبة" : c.licenseStatus === "pending" ? "قيد المراجعة" : "لا يوجد") : "";
+    const rows = c ? [["الاسم", c.fullName], ["الجنسية", c.nationality || "-"], ["الوظيفة", c.jobName || "بدون وظيفة"], ["رقم الهوية", c.civilId], ["رخصة القيادة", lic], ["تاريخ الإصدار", certDate(c.createdAt)], ["حالة الهوية", status]] : [];
+    if (c && c.cardRevoked) rows.push(["تاريخ الإلغاء", c.cardRevokedAt ? certDate(c.cardRevokedAt) : "-"]);
+    if (c) rows.push(["تاريخ التحقق", certDate(new Date())]);
+    res.set("Cache-Control", "no-store").type("html").send(cardVerifyPage({ kind: "الهوية المدنية", status, color, icon, msg, rows }, await certAssetsNow()));
 });
 
 // ===================== 🖼️ صور البطاقات العسكرية (العضو يرفع → الإدارة تراجع → تنزل بالبطاقة) =====================
@@ -3892,7 +3926,7 @@ function ensureSeniorOnly(req, res, next) {
     next();
 }
 function cardCtlRow(p) {
-    return { uid: p.discord, name: p.registeredName || "", rank: p.rank || "", sectorLabel: (p.sector && CONFIG.SECTORS[p.sector]) || p.unit || "", cardNumber: p.cardNumber || "",
+    return { uid: p.discord, name: p.registeredName || "", rank: p.rank || "", unit: p.unit || "", sectorLabel: (p.sector && CONFIG.SECTORS[p.sector]) || p.unit || "", cardNumber: p.cardNumber || "",
         revoked: !!p.cardRevoked, revokedAt: p.cardRevokedAt || null, revokedByName: p.cardRevokedByName || null, reason: p.cardRevokedReason || null };
 }
 const CARD_CTL_FIELDS = { discord: 1, registeredName: 1, rank: 1, sector: 1, unit: 1, cardNumber: 1, cardRevoked: 1, cardRevokedAt: 1, cardRevokedByName: 1, cardRevokedReason: 1 };
@@ -3928,6 +3962,43 @@ app.post("/api/card-control/:uid/restore", ensureSeniorOnly, async (req, res) =>
         const r = await Personnel.updateOne({ discord: uid }, { $set: { cardRevoked: false, cardRevokedAt: null, cardRevokedBy: null, cardRevokedByName: null, cardRevokedReason: null } });
         if (!r.matchedCount) return res.status(404).json({ error: "غير موجود" });
         await logEvent({ action: "إعادة تفعيل بطاقة", discordId: uid, actorId: req.user.id, actorTag: req.user.username, details: "إعادة تفعيل البطاقة العسكرية" });
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: "تعذر إعادة التفعيل" }); }
+});
+// ===================== 🪪 تحكم بطاقة المواطن (كبار المسؤولين): إلغاء الهوية / إعادة تفعيلها =====================
+function czCardRow(c) {
+    return { uid: c.uid, name: c.fullName || "", civilId: c.civilId || "", nationality: c.nationality || "", age: c.age || "", jobName: c.jobName || null, createdAt: c.createdAt,
+        suspended: c.status === "suspended", licenseStatus: c.licenseStatus || "none", revoked: !!c.cardRevoked, revokedAt: c.cardRevokedAt || null, revokedByName: c.cardRevokedByName || null, reason: c.cardRevokedReason || null };
+}
+app.get("/api/cz/card-control/list", ensureSeniorOnly, async (req, res) => {
+    try {
+        const q = String(req.query.q || "").trim().slice(0, 40);
+        let filter;
+        if (q.length >= 2) {
+            const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+            filter = { $or: [{ fullName: rx }, { civilId: rx }, { jobName: rx }] };
+        } else filter = { cardRevoked: true };
+        const list = await Citizen.find(filter, { passwordHash: 0, passwordEnc: 0, answers: 0 }).sort({ cardRevokedAt: -1, createdAt: -1 }).limit(q.length >= 2 ? 30 : 200).lean();
+        res.json({ list: list.map(czCardRow), searching: q.length >= 2 });
+    } catch (e) { res.status(500).json({ error: "تعذر تحميل البطاقات" }); }
+});
+app.post("/api/cz/card-control/:uid/revoke", ensureSeniorOnly, async (req, res) => {
+    try {
+        const uid = String(req.params.uid || "");
+        const me = await Personnel.findOne({ discord: req.user.id }, { registeredName: 1 }).lean();
+        const reason = String((req.body && req.body.reason) || "").trim().slice(0, 200) || null;
+        const c = await Citizen.findOneAndUpdate({ uid }, { $set: { cardRevoked: true, cardRevokedAt: new Date(), cardRevokedByName: (me && me.registeredName) || req.user.username || "كبار المسؤولين", cardRevokedReason: reason } });
+        if (!c) return res.status(404).json({ error: "المواطن غير موجود" });
+        await logEvent({ action: "إلغاء هوية مواطن", actorId: req.user.id, actorTag: req.user.username, details: (c.fullName || "") + (c.civilId ? " — هوية " + c.civilId : "") + (reason ? " — " + reason : "") });
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: "تعذر إلغاء الهوية" }); }
+});
+app.post("/api/cz/card-control/:uid/restore", ensureSeniorOnly, async (req, res) => {
+    try {
+        const uid = String(req.params.uid || "");
+        const c = await Citizen.findOneAndUpdate({ uid }, { $set: { cardRevoked: false, cardRevokedAt: null, cardRevokedByName: null, cardRevokedReason: null } });
+        if (!c) return res.status(404).json({ error: "المواطن غير موجود" });
+        await logEvent({ action: "إعادة تفعيل هوية مواطن", actorId: req.user.id, actorTag: req.user.username, details: (c.fullName || "") + (c.civilId ? " — هوية " + c.civilId : "") });
         res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: "تعذر إعادة التفعيل" }); }
 });
@@ -16734,12 +16805,32 @@ function czInjectStyle() {
         '.cz-box{width:100%;max-width:420px;max-height:90vh;overflow:auto;border-radius:18px;padding:18px;background:#0f172a;border:1px solid rgba(148,163,184,.25)}' +
         '.cz-box h3{margin:0 0 12px}.cz-box input,.cz-box textarea,.cz-box select{width:100%;margin:4px 0 10px}' +
         '.cz-note{border-radius:12px;padding:10px 12px;margin:10px 0;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.4);color:#fde68a;font-size:13px;line-height:1.8}' +
-        '.cz-img{max-width:100%;max-height:200px;border-radius:10px;margin:6px 0;display:block}';
+        '.cz-img{max-width:100%;max-height:200px;border-radius:10px;margin:6px 0;display:block}' +
+        '.cz-mil{position:relative;overflow:hidden;border-radius:20px;padding:16px 18px;color:#fff;cursor:pointer;background:linear-gradient(135deg,#07140c 0%,#12301d 55%,#091a10 100%);border:1px solid rgba(250,204,21,.5);box-shadow:0 12px 34px rgba(0,0,0,.5),inset 0 0 0 1px rgba(255,255,255,.06);margin-bottom:8px}' +
+        '.cz-mil:before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 88% 8%,rgba(250,204,21,.22),transparent 45%),repeating-linear-gradient(135deg,rgba(255,255,255,.04) 0 3px,transparent 3px 16px);pointer-events:none}' +
+        '.cz-mil:after{content:"";position:absolute;top:-60%;left:-60%;width:60%;height:220%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.14),transparent);transform:rotate(15deg);animation:czshine 5.5s ease-in-out infinite;pointer-events:none}' +
+        '.cz-mil .cz-logo{background:linear-gradient(135deg,#facc15,#b45309);color:#07140c}' +
+        '.cz-mil .cz-id-sub{color:#bbf7d0}' +
+        '.cz-mil .cz-avatar{background:linear-gradient(160deg,#166534,#052e16);overflow:hidden;position:relative}' +
+        '.cz-mil .cz-avatar img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}' +
+        '.cz-mil .cz-f span{color:#bbf7d0}' +
+        '.cz-mil-badge{margin-right:auto;padding:4px 11px;border-radius:999px;font-size:11px;font-weight:700;background:rgba(250,204,21,.14);border:1px solid rgba(250,204,21,.5);color:#fde68a;position:relative}' +
+        '.cz-mil-badge.off{background:rgba(239,68,68,.16);border-color:rgba(239,68,68,.5);color:#fca5a5}' +
+        '.cz-mil-stripes{display:flex;flex-direction:column;gap:3px;position:relative}.cz-mil-stripes i{display:block;width:34px;height:5px;border-radius:2px;background:linear-gradient(90deg,#facc15,#d97706)}' +
+        '.cz-mil-void{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(2,6,15,.55);font-size:34px;font-weight:800;color:#f87171;transform:rotate(-12deg);letter-spacing:4px;z-index:2}' +
+        '.cz-mil-next{font-size:12px;color:#94a3b8;text-align:center;margin:0 0 10px;line-height:1.8}.cz-mil-next b{color:#fde68a}' +
+        '.cz-bcwrap{display:block;margin-top:12px;background:#fff;border-radius:8px;padding:7px 10px 4px;text-decoration:none;position:relative}' +
+        '.cz-bcwrap svg{display:block;width:100%;height:48px}' +
+        '.cz-bcwrap small{display:block;text-align:center;color:#0f172a;font:700 11px/1.4 Consolas,monospace;letter-spacing:5px;margin-top:2px}' +
+        '.cz-bcwrap em{display:block;text-align:center;color:#64748b;font-style:normal;font-size:10px;letter-spacing:0}' +
+        '.cc-sel{cursor:pointer}.cc-sel.on{border-color:#facc15!important;box-shadow:0 0 0 1px #facc15}' +
+        '.cc-panel{border:1px solid rgba(250,204,21,.45);border-radius:16px;padding:14px;margin-bottom:12px;background:rgba(250,204,21,.05)}' +
+        '.cc-btns{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:10px}.cc-btns .btn{width:100%;margin:0;text-align:center;text-decoration:none;display:block}';
     document.head.appendChild(s);
 }
 function czInitial(n) { n = String(n || '').trim(); return n ? n.charAt(0) : '؟'; }
 function czIdCard(c) {
-    return '<div class="cz-id">' +
+    return '<div class="cz-id">' + (c.cardRevoked ? '<div class="cz-mil-void">ملغاة</div>' : '') +
         '<div class="cz-id-top"><div class="cz-logo">' + CZ_BOLT + '</div><div><div class="cz-id-title">الهوية المدنية</div><div class="cz-id-sub">FLASH CITY • CIVIL ID</div></div></div>' +
         '<div class="cz-id-body"><div class="cz-avatar">' + czEsc(czInitial(c.fullName)) + '</div><div class="cz-fields">' +
         '<div class="cz-f"><span>الاسم</span><b>' + czEsc(c.fullName) + '</b></div>' +
@@ -16749,6 +16840,47 @@ function czIdCard(c) {
         '<div class="cz-f"><span>تاريخ الإصدار</span><b>' + czDate(c.createdAt) + '</b></div>' +
         '</div></div>' +
         '<div class="cz-id-foot"><div><div style="font-size:11px;color:#bfdbfe">رقم الهوية</div><div class="cz-num">' + czEsc(c.civilId || '----') + '</div></div><div class="cz-chip"></div></div>' +
+        (/^[0-9]{4,5}$/.test(String(c.civilId || '')) ? czBcStrip('FLASH-C-', c.civilId, '/verify-id/' + c.civilId) : '') +
+        '</div>';
+}
+var CZ_C128 = ['212222','222122','222221','121223','121322','131222','122213','122312','132212','221213','221312','231212','112232','122132','122231','113222','123122','123221','223211','221132','221231','213212','223112','312131','311222','321122','321221','312212','322112','322211','212123','212321','232121','111323','131123','131321','112313','132113','132311','211313','231113','231311','112133','112331','132131','113123','113321','133121','313121','211331','231131','213113','213311','213131','311123','311321','331121','312113','312311','332111','314111','221411','431111','111224','111422','121124','121421','141122','141221','112214','112412','122114','122411','142112','142211','241211','221114','413111','241112','134111','111242','121142','121241','114212','124112','124211','411212','421112','421211','212141','214121','412121','111143','111341','131141','114113','114311','411113','411311','113141','114131','311141','411131','211412','211214','211232','2331112'];
+function czBarcode(text) {
+    text = String(text);
+    var codes = [104], sum = 104, i;
+    for (i = 0; i < text.length; i++) { var v = text.charCodeAt(i) - 32; if (v < 0 || v > 94) v = 0; codes.push(v); sum += v * (i + 1); }
+    codes.push(sum % 103); codes.push(106);
+    var x = 12, rects = '';
+    codes.forEach(function (c) {
+        var pat = CZ_C128[c];
+        for (var k = 0; k < pat.length; k++) { var w = +pat.charAt(k); if (k % 2 === 0) rects += '<rect x="' + x + '" y="0" width="' + w + '" height="50"/>'; x += w; }
+    });
+    x += 12;
+    return '<svg viewBox="0 0 ' + x + ' 50" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg" fill="#0f172a" shape-rendering="crispEdges">' + rects + '</svg>';
+}
+function czBcStrip(prefix, num, url) {
+    return '<a class="cz-bcwrap" href="' + czEsc(url) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()">' + czBarcode(prefix + num) + '<small>' + czEsc(num) + '</small><em>اضغط على الباركود لعرض حالة البطاقة</em></a>';
+}
+function czMilCard(p, o) {
+    o = o || {};
+    var f = cardFields(p);
+    var off = !!(p.isBlocked || f.revoked);
+    var av = f.avatar ? '<img src="' + czEsc(f.avatar) + '" alt="" onerror="this.remove()">' : '';
+    var stripes = '<i></i><i></i><i></i>';
+    return '<div id="' + (o.id || 'home-card') + '">' +
+        '<div class="cz-mil"' + (o.preview ? '' : ' onclick="renderCard()"') + '>' +
+        (f.revoked ? '<div class="cz-mil-void">ملغاة</div>' : '') +
+        '<div class="cz-id-top"><div class="cz-logo">' + CZ_BOLT + '</div><div><div class="cz-id-title">البطاقة العسكرية</div><div class="cz-id-sub">FLASH CITY • MILITARY ID</div></div>' +
+        '<div class="cz-mil-badge' + (off ? ' off' : '') + '">' + (off ? '🚫 موقوفة' : '🪖 فعّال') + '</div></div>' +
+        '<div class="cz-id-body"><div class="cz-avatar">' + czEsc(czInitial(f.name)) + av + '</div><div class="cz-fields">' +
+        '<div class="cz-f"><span>الاسم</span><b data-k="name">' + czEsc(f.name) + '</b></div>' +
+        '<div class="cz-f"><span>الرتبة</span><b data-k="rank">' + czEsc(f.rank) + '</b></div>' +
+        '<div class="cz-f"><span>اليونت</span><b data-k="unit">' + czEsc(f.unit) + '</b></div>' +
+        '</div></div>' +
+        '<div class="cz-id-foot"><div><div style="font-size:11px;color:#bbf7d0">رقم البطاقة</div><div class="cz-num" data-k="num">' + czEsc(f.num) + '</div></div>' +
+        '<div style="display:flex;align-items:center;gap:12px"><div class="cz-mil-stripes">' + stripes + '</div><div class="cz-chip"></div></div></div>' +
+        (/^[0-9]{8}$/.test(String(f.num)) ? czBcStrip('FLASH-M-', f.num, '/verify-card/' + f.num) : '') +
+        '</div>' +
+        (o.preview ? '' : '<div class="cz-mil-next"><span id="home-next">' + czEsc(p.nextRank ? (f.rank + ' ——> ' + p.nextRank) : 'أعلى رتبة') + '</span><br><b id="home-remaining">' + czEsc(remainText(o.nextRank, o.remaining)) + '</b></div>') +
         '</div>';
 }
 function czLicCard(c) {
@@ -17673,14 +17805,14 @@ function renderDashboard() {
         \${flAttCardHtml()}<div id="push-banner"></div><div id="court-soon">\${courtSoonHtml()}</div>
         \${ME.maintenance ? '<div class="card" style="border-color:var(--amber);color:#fbbf24;">⚠️ الموقع في وضع الصيانة حالياً</div>' : ''}
         \${ME.seniorTemp ? '<div class="card" style="border-color:var(--amber);color:#fbbf24;">🔑 هذا حساب كبير مسؤولين جديد خاص فيك. بريدك: <b dir="ltr">' + ME.accountEmail + '</b> — غيّر البريد وكلمة المرور من لوحة كبار المسؤولين ← الحسابات المقبولة ← تعديل، وبعدها يصير حسابك أنت. لو ما غيّرتها ودخلت مرة ثانية بالبيانات الافتراضية بينفتح لك حساب جديد غير هذا.</div>' : ''}
-        \${cardBlock(ME, { id: 'home-card', hasProgress: true, nextRank: ME.nextRank, remaining: ME.pointsRemaining, remainId: 'home-remaining' })}
+        \${czMilCard(ME, { id: 'home-card', nextRank: ME.nextRank, remaining: ME.pointsRemaining })}
         <div class="cz-tile" style="margin-top:16px;">
             <div><b id="home-points">\${ME.points}</b><small>النقاط</small></div>
             <div><b id="mine-count">-</b><small>مخالفاتي</small></div>
             <div><b id="home-rank" style="font-size:15px;">\${ME.isBlocked ? '🚫 موقوف' : '✅ فعّال'}</b><small>الحالة</small></div>
         </div>
         <div class="cz-actions">
-            <button class="btn" onclick="renderCard()">🪪 بطاقتي</button>
+            <button class="btn" onclick="renderCard()">🪪 بطاقتي الكاملة</button>
             \${!ME.violationsDisabled ? (ME.isAntiDrugs && !ME.isSeniorAdmin
                 ? '<button class="btn" onclick="renderNewReport()">📝 تسجيل تقرير</button>'
                 : '<button class="btn" onclick="renderNewViolation()">🚨 تسجيل مخالفة</button>') : ''}
@@ -17999,6 +18131,7 @@ function renderAdmin(startTab) {
             <div class="tab" onclick="adminTab('accounts', this)">✅ الحسابات المقبولة</div>
             <div class="tab" onclick="adminTab('personnel', this)">ملفات العسكريين</div>
             <div class="tab" onclick="adminTab('sfile', this)">📇 عرض ملف عسكري</div>
+            <div class="tab" id="tab-cards" onclick="adminTab('cards', this)">🪪 تحكم بطاقة عسكرية</div>
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
         </div></div>
@@ -18014,6 +18147,7 @@ function renderAdmin(startTab) {
         </div></div>
         <div class="tab-group"><div class="tab-group-title">🚗 المواطنون</div><div class="tabs">
             <div class="tab" id="tab-czcit" onclick="adminTab('czcit', this)">👥 المواطنون</div>
+            <div class="tab" id="tab-czcards" onclick="adminTab('czcards', this)">🪪 تحكم بطاقة مواطن</div>
             <div class="tab" id="tab-czlic" onclick="adminTab('czlic', this)">🪪 طلبات الرخص والمركبات</div>
             <div class="tab" onclick="adminTab('vehicles', this)">المركبات</div>
             <div class="tab" id="tab-czprice" onclick="adminTab('czprice', this)">💰 أسعار المخالفات</div>
@@ -18049,6 +18183,7 @@ function adminTab(name, el) {
     if (name === 'czjobs') czLoadJobs();
     if (name === 'cphoto') loadCardPhotoTab();
     if (name === 'cards') loadCardsTab();
+    if (name === 'czcards') czCardsOpen();
     if (name === 'accounts') loadAccounts();
     if (name === 'personnel') loadPersonnel();
     if (name === 'vehicles') loadVehicles();
@@ -19611,7 +19746,7 @@ async function certIssue(kind) {
     } catch (e) { toast(e.message); }
 }
 async function certRevoke(code) {
-    if (!confirm('تأكد: سحب هذي الشهادة من ملف العسكري؟ (بتظهر "ملغاة" عند مسح الباركود)')) return;
+    if (!(await confirmModal('تأكد: سحب هذي الشهادة من ملف العسكري؟ (بتظهر "ملغاة" عند مسح الباركود)'))) return;
     try {
         await api('/api/certs/' + encodeURIComponent(code) + '/revoke', { method: 'POST' });
         toast('تم سحب الشهادة');
@@ -20811,7 +20946,6 @@ async function searchPersonnel() {
                     <div style="font-size:13px;color:#94a3b8;">النقاط: \${p.points} \${p.isBlocked ? '• 🚫 موقوف' : ''} • رقم البطاقة: \${p.cardNumber || '-'}</div>
                 </div>
                 <div class="row" style="gap:6px;">
-                    \${devLoginBtn(p.discord)}
                     <button class="btn sm gray" onclick="openCardModal('\${p.discord}')">🪪 البطاقة</button>
                     <button class="btn sm gray" onclick="toggleEdit(\${i})">تعديل</button>
                     <button class="btn sm gray" onclick="addNote('\${p.discord}')">ملاحظة</button>
@@ -21144,7 +21278,7 @@ async function cpReview(uid, ok) {
     } catch (e) { toast(e.message || 'صار خطأ'); }
 }
 async function cpDelete(uid) {
-    if (!confirm('تأكد: حذف صورة هذي البطاقة؟ بترجع البطاقة بدون صورة.')) return;
+    if (!(await confirmModal('تأكد: حذف صورة هذي البطاقة؟ بترجع البطاقة بدون صورة.'))) return;
     try {
         await api('/api/card-photos/' + encodeURIComponent(uid) + '/delete', { method: 'POST', body: JSON.stringify({}) });
         toast('تم حذف الصورة');
@@ -21167,11 +21301,20 @@ function cardsRowHtml(r) {
             '<button class="btn gray sm" data-n="' + cardEsc(r.cardNumber) + '" onclick="cardCtlCopy(this.dataset.n)">📋 نسخ رقم البطاقة</button>' : '') +
         '</div></div>';
 }
+var CC_ROWS = {}, CC_SEL = null, CC_SELROW = null;
 async function loadCardsTab() {
     var box = document.getElementById('admin-content');
     if (!box) return;
-    box.innerHTML = '<div class="card"><h2>🪪 تحكم البطاقات</h2><input id="cc-q" placeholder="ابحث بالاسم أو رقم البطاقة أو اليونت لإلغاء بطاقة..." oninput="cardsSearch()" style="margin-top:8px;"></div><div id="cc-list"><div class="card center" style="color:var(--muted);">جارِ التحميل...</div></div>';
+    czInjectStyle();
+    CC_SEL = null; CC_SELROW = null;
+    box.innerHTML = '<div class="card"><h2>🪪 تحكم البطاقة العسكرية</h2><input id="cc-q" placeholder="ابحث بالاسم أو اليونت أو رقم البطاقة..." oninput="cardsSearch()" style="margin-top:8px;"></div><div id="cc-panel"></div><div id="cc-list"><div class="card center" style="color:var(--muted);">جارِ التحميل...</div></div>';
     cardsSearch(true);
+}
+function ccRowHtml(r) {
+    return '<div class="card cc-sel' + (CC_SEL === r.uid ? ' on' : '') + '" data-u="' + cardEsc(r.uid) + '" onclick="ccSelect(this.dataset.u)" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">' +
+        '<div style="flex:1;min-width:150px;"><b>' + cardEsc(r.name) + '</b> ' + (r.revoked ? '<span style="color:#f87171;font-weight:700;">• ملغاة</span>' : '<span style="color:#4ade80;">• سارية</span>') +
+        '<div style="font-size:12px;color:var(--muted);margin-top:4px;">' + cardEsc([r.rank, r.unit || r.sectorLabel, r.cardNumber].filter(Boolean).join(' • ')) + '</div></div>' +
+        '<span class="btn gray sm">🎛️ تحكم</span></div>';
 }
 function cardsSearch(now) {
     clearTimeout(CC_TM);
@@ -21183,10 +21326,56 @@ function cardsSearch(now) {
             var d = await api('/api/card-control/list?q=' + encodeURIComponent(q), { noLock: true });
             if (currentAdminTab !== 'cards' || !document.getElementById('cc-list')) return;
             var list = d.list || [];
+            CC_ROWS = {}; list.forEach(function (r) { CC_ROWS[r.uid] = r; });
+            if (CC_SEL && !CC_ROWS[CC_SEL] && CC_SELROW) CC_ROWS[CC_SEL] = CC_SELROW;
             var head = d.searching ? '' : '<div class="card"><h3>🚫 البطاقات الملغاة (' + list.length + ')</h3></div>';
-            out.innerHTML = head + (list.length ? list.map(cardsRowHtml).join('') : '<div class="card center" style="color:var(--muted);">' + (d.searching ? 'ما لقيت أحد' : 'ما فيه بطاقات ملغاة ✅ — ابحث فوق عشان تلغي بطاقة') + '</div>');
+            out.innerHTML = head + (list.length ? list.map(ccRowHtml).join('') : '<div class="card center" style="color:var(--muted);">' + (d.searching ? 'ما لقيت أحد' : 'ما فيه بطاقات ملغاة ✅ — ابحث فوق واختر عسكري للتحكم ببطاقته') + '</div>');
         } catch (e) { out.innerHTML = '<div class="card" style="color:#f87171;">' + cardEsc(e.message) + '</div>'; }
     }, now === true ? 0 : 300);
+}
+function ccSelect(uid) {
+    var r = CC_ROWS[uid]; if (!r) return;
+    CC_SEL = uid; CC_SELROW = r;
+    document.querySelectorAll('#cc-list .cc-sel').forEach(function (n) { n.classList.toggle('on', n.getAttribute('data-u') === uid); });
+    ccPanel();
+    var pn = document.getElementById('cc-panel'); if (pn && pn.scrollIntoView) pn.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+function ccClose() { CC_SEL = null; CC_SELROW = null; ccPanel(); document.querySelectorAll('#cc-list .cc-sel').forEach(function (n) { n.classList.remove('on'); }); }
+function ccPanel() {
+    var box = document.getElementById('cc-panel'); if (!box) return;
+    var r = CC_SEL ? CC_ROWS[CC_SEL] : null;
+    if (!r) { box.innerHTML = ''; return; }
+    var p = { discord: r.uid, registeredName: r.name, rank: r.rank, unit: r.unit || r.sectorLabel, cardNumber: r.cardNumber, cardRevoked: r.revoked, sector: r.sector || null };
+    var dt = r.revokedAt ? new Date(r.revokedAt).toLocaleDateString('ar-SA') : '';
+    box.innerHTML = '<div class="cc-panel">' +
+        '<div class="row"><b>🎛️ لوحة التحكم بالبطاقة</b><button class="btn gray sm" onclick="ccClose()">✕ إغلاق</button></div>' +
+        '<div style="margin-top:10px;">' + czMilCard(p, { id: 'cc-prev', preview: true }) + '</div>' +
+        (r.revoked ? '<div style="font-size:12px;color:var(--muted);margin:4px 0;">أُلغيت ' + cardEsc(dt) + (r.revokedByName ? ' بواسطة ' + cardEsc(r.revokedByName) : '') + (r.reason ? ' — ' + cardEsc(r.reason) : '') + '</div>' : '') +
+        '<div class="cc-btns">' +
+        (r.revoked
+            ? '<button class="btn" data-u="' + cardEsc(r.uid) + '" onclick="cardCtl(this.dataset.u, false)">♻️ إعادة تفعيل البطاقة</button>'
+            : '<button class="btn danger" data-u="' + cardEsc(r.uid) + '" onclick="cardCtl(this.dataset.u, true)">🚫 إلغاء البطاقة</button>') +
+        (r.cardNumber ? '<a class="btn gray" target="_blank" href="/verify-card/' + cardEsc(r.cardNumber) + '">🔍 صفحة التحقق</a>' : '') +
+        (r.cardNumber ? '<button class="btn gray" data-n="' + cardEsc(r.cardNumber) + '" onclick="cardCtlCopy(this.dataset.n)">📋 نسخ رقم البطاقة</button>' : '') +
+        '<button class="btn gray" data-u="' + cardEsc(r.uid) + '" onclick="ccShowFull(this.dataset.u)">🪪 عرض البطاقة الكاملة</button>' +
+        '<button class="btn gray" data-u="' + cardEsc(r.uid) + '" onclick="cpDelete(this.dataset.u)">🖼️ حذف صورة البطاقة</button>' +
+        '</div></div>';
+}
+async function ccShowFull(uid) {
+    var r = CC_ROWS[uid]; if (!r) return;
+    try {
+        var d = await api('/api/senior/personnel?q=' + encodeURIComponent(r.cardNumber || r.name), { noLock: true });
+        cardRemember(d.list);
+        openCardModal(uid);
+    } catch (e) { toast(e.message || 'صار خطأ'); }
+}
+async function ccReload(uid) {
+    var r = CC_ROWS[uid];
+    try {
+        var d = await api('/api/card-control/list?q=' + encodeURIComponent((r && r.name) || ''), { noLock: true });
+        (d.list || []).forEach(function (x) { if (x.uid === uid) { CC_ROWS[uid] = x; CC_SELROW = x; } });
+    } catch (e) {}
+    ccPanel(); cardsSearch(true);
 }
 async function cardCtl(uid, revoke) {
     try {
@@ -21196,12 +21385,108 @@ async function cardCtl(uid, revoke) {
             await api('/api/card-control/' + encodeURIComponent(uid) + '/revoke', { method: 'POST', body: JSON.stringify({ reason: String(reason) }) });
             toast('تم إلغاء البطاقة');
         } else {
-            if (!confirm('إعادة تفعيل هذي البطاقة؟')) return;
+            if (!(await confirmModal('إعادة تفعيل هذي البطاقة؟'))) return;
             await api('/api/card-control/' + encodeURIComponent(uid) + '/restore', { method: 'POST', body: JSON.stringify({}) });
             toast('تمت إعادة تفعيل البطاقة ✅');
         }
-        cardsSearch(true);
+        if (CC_ROWS[uid]) ccReload(uid); else cardsSearch(true);
     } catch (e) { toast(e.message || 'صار خطأ'); }
+}
+// ===== تاب تحكم بطاقة المواطن (كبار المسؤولين): بحث ← اختيار ← لوحة تحكم + إلغاء الهوية =====
+var CZC_ROWS = {}, CZC_SEL = null, CZC_SELROW = null, CZC_TM = null;
+async function czCardsOpen() {
+    var box = document.getElementById('admin-content');
+    if (!box) return;
+    czInjectStyle();
+    CZC_SEL = null; CZC_SELROW = null;
+    box.innerHTML = '<div class="card"><h2>🪪 تحكم بطاقة المواطن</h2><input id="czc-q" placeholder="ابحث بالاسم أو رقم الهوية أو الوظيفة..." oninput="czCSearch()" style="margin-top:8px;"></div><div id="czc-panel"></div><div id="czc-list"><div class="card center" style="color:var(--muted);">جارِ التحميل...</div></div>';
+    czCSearch(true);
+}
+function czCRowHtml(r) {
+    return '<div class="card cc-sel' + (CZC_SEL === r.uid ? ' on' : '') + '" data-u="' + czEsc(r.uid) + '" onclick="czCSelect(this.dataset.u)" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">' +
+        '<div style="flex:1;min-width:150px;"><b>' + czEsc(r.name) + '</b> ' + (r.revoked ? '<span style="color:#f87171;font-weight:700;">• ملغاة</span>' : '<span style="color:#4ade80;">• سارية</span>') + (r.suspended ? ' <span style="color:#fbbf24;">• ⛔ موقوف</span>' : '') +
+        '<div style="font-size:12px;color:var(--muted);margin-top:4px;">' + czEsc([r.civilId ? 'هوية ' + r.civilId : 'بدون رقم هوية', r.jobName || 'بدون وظيفة', r.nationality].filter(Boolean).join(' • ')) + '</div></div>' +
+        '<span class="btn gray sm">🎛️ تحكم</span></div>';
+}
+function czCSearch(now) {
+    clearTimeout(CZC_TM);
+    CZC_TM = setTimeout(async function () {
+        var inp = document.getElementById('czc-q'), out = document.getElementById('czc-list');
+        if (!inp || !out) return;
+        var q = inp.value.trim();
+        try {
+            var d = await api('/api/cz/card-control/list?q=' + encodeURIComponent(q), { noLock: true });
+            if (currentAdminTab !== 'czcards' || !document.getElementById('czc-list')) return;
+            var list = d.list || [];
+            CZC_ROWS = {}; list.forEach(function (r) { CZC_ROWS[r.uid] = r; });
+            if (CZC_SEL && !CZC_ROWS[CZC_SEL] && CZC_SELROW) CZC_ROWS[CZC_SEL] = CZC_SELROW;
+            var head = d.searching ? '' : '<div class="card"><h3>🚫 الهويات الملغاة (' + list.length + ')</h3></div>';
+            out.innerHTML = head + (list.length ? list.map(czCRowHtml).join('') : '<div class="card center" style="color:var(--muted);">' + (d.searching ? 'ما لقيت أحد' : 'ما فيه هويات ملغاة ✅ — ابحث فوق واختر مواطن للتحكم ببطاقته') + '</div>');
+        } catch (e) { out.innerHTML = '<div class="card" style="color:#f87171;">' + czEsc(e.message) + '</div>'; }
+    }, now === true ? 0 : 300);
+}
+function czCSelect(uid) {
+    var r = CZC_ROWS[uid]; if (!r) return;
+    CZC_SEL = uid; CZC_SELROW = r;
+    document.querySelectorAll('#czc-list .cc-sel').forEach(function (n) { n.classList.toggle('on', n.getAttribute('data-u') === uid); });
+    czCPanel();
+    var pn = document.getElementById('czc-panel'); if (pn && pn.scrollIntoView) pn.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+function czCClose() { CZC_SEL = null; CZC_SELROW = null; czCPanel(); document.querySelectorAll('#czc-list .cc-sel').forEach(function (n) { n.classList.remove('on'); }); }
+function czCPanel() {
+    var box = document.getElementById('czc-panel'); if (!box) return;
+    var r = CZC_SEL ? CZC_ROWS[CZC_SEL] : null;
+    if (!r) { box.innerHTML = ''; return; }
+    var dt = r.revokedAt ? new Date(r.revokedAt).toLocaleDateString('ar-SA') : '';
+    box.innerHTML = '<div class="cc-panel">' +
+        '<div class="row"><b>🎛️ لوحة التحكم بالبطاقة</b><button class="btn gray sm" onclick="czCClose()">✕ إغلاق</button></div>' +
+        '<div style="margin-top:10px;">' + czIdCard({ fullName: r.name, nationality: r.nationality, age: r.age, jobName: r.jobName, createdAt: r.createdAt, civilId: r.civilId, cardRevoked: r.revoked }) + '</div>' +
+        (r.revoked ? '<div style="font-size:12px;color:var(--muted);margin:4px 0;">أُلغيت ' + czEsc(dt) + (r.revokedByName ? ' بواسطة ' + czEsc(r.revokedByName) : '') + (r.reason ? ' — ' + czEsc(r.reason) : '') + '</div>' : '') +
+        '<div class="cc-btns">' +
+        (r.revoked
+            ? '<button class="btn" data-u="' + czEsc(r.uid) + '" onclick="czCardToggle(this.dataset.u, false)">♻️ إعادة تفعيل البطاقة</button>'
+            : '<button class="btn danger" data-u="' + czEsc(r.uid) + '" onclick="czCardToggle(this.dataset.u, true)">🚫 إلغاء البطاقة</button>') +
+        (r.civilId ? '<a class="btn gray" target="_blank" href="/verify-id/' + czEsc(r.civilId) + '">🔍 صفحة التحقق</a>' : '') +
+        (r.civilId ? '<button class="btn gray" data-n="' + czEsc(r.civilId) + '" onclick="cardCtlCopy(this.dataset.n)">📋 نسخ رقم الهوية</button>' : '') +
+        '<button class="btn gray" data-u="' + czEsc(r.uid) + '" onclick="czCEditId(this.dataset.u)">✏️ تعديل رقم الهوية</button>' +
+        (r.licenseStatus === 'approved' ? '<button class="btn gray" data-u="' + czEsc(r.uid) + '" onclick="czCLicRevoke(this.dataset.u)">🚫 سحب الرخصة</button>' : '') +
+        '<button class="btn gray" data-u="' + czEsc(r.uid) + '" data-s="' + (r.suspended ? 'approved' : 'suspended') + '" onclick="czCSusp(this.dataset.u, this.dataset.s)">' + (r.suspended ? '✅ فك إيقاف الحساب' : '⛔ إيقاف الحساب') + '</button>' +
+        '</div></div>';
+}
+async function czCReload(uid) {
+    var r = CZC_ROWS[uid];
+    try {
+        var d = await api('/api/cz/card-control/list?q=' + encodeURIComponent((r && r.name) || ''), { noLock: true });
+        (d.list || []).forEach(function (x) { if (x.uid === uid) { CZC_ROWS[uid] = x; CZC_SELROW = x; } });
+    } catch (e) {}
+    czCPanel(); czCSearch(true);
+}
+async function czCardToggle(uid, revoke) {
+    try {
+        if (revoke) {
+            var reason = await promptModal('سبب إلغاء البطاقة (اختياري):', '');
+            if (reason === null || reason === undefined || reason === false) return;
+            await api('/api/cz/card-control/' + encodeURIComponent(uid) + '/revoke', { method: 'POST', body: JSON.stringify({ reason: String(reason) }) });
+            toast('تم إلغاء بطاقة المواطن');
+        } else {
+            if (!(await confirmModal('إعادة تفعيل هذي البطاقة؟'))) return;
+            await api('/api/cz/card-control/' + encodeURIComponent(uid) + '/restore', { method: 'POST', body: JSON.stringify({}) });
+            toast('تمت إعادة تفعيل البطاقة ✅');
+        }
+        czCReload(uid);
+    } catch (e) { toast(e.message || 'صار خطأ'); }
+}
+function czCEditId(uid) {
+    czAsk('تعديل رقم الهوية', 'الرقم الجديد (4 أو 5 أرقام)', '1234', 'حفظ', function (v) {
+        api('/api/cz/citizens/' + encodeURIComponent(uid) + '/civil-id', { method: 'POST', body: JSON.stringify({ civilId: v }) }).then(function () { toast('✅ تم التعديل'); czCReload(uid); }).catch(function (e) { toast(e.message); });
+    }, true);
+}
+async function czCLicRevoke(uid) {
+    if (!(await confirmModal('سحب رخصة هذا المواطن؟'))) return;
+    api('/api/cz/citizens/' + encodeURIComponent(uid) + '/license-revoke', { method: 'POST', body: '{}' }).then(function () { toast('تم سحب الرخصة'); czCReload(uid); }).catch(function (e) { toast(e.message); });
+}
+function czCSusp(uid, st) {
+    api('/api/cz/citizens/' + encodeURIComponent(uid) + '/status', { method: 'POST', body: JSON.stringify({ status: st }) }).then(function () { toast('✅ تم'); czCReload(uid); }).catch(function (e) { toast(e.message); });
 }
 function cardCtlCopy(n) {
     try { navigator.clipboard.writeText(String(n)).then(function () { toast('اننسخ رقم البطاقة 📋'); }, function () { toast(String(n)); }); }
@@ -21438,6 +21723,7 @@ function accCitCard(a) {
         accRow('البريد', a.email) + accPwRow(a.password) + accRow('العمر', a.age) + accRow('الجنسية', a.nationality) +
         accRow('رقم الهوية', a.civilId || '-') + accRow('الرخصة', lic) + accRow('المركبات', a.vehiclesCount || 0) +
         '<div class="row" style="gap:8px;margin-top:12px;flex-wrap:wrap;">' +
+            (a.suspended ? '' : devLoginBtn(a.uid)) +
             '<button class="btn danger sm" data-u="' + a.uid + '" onclick="czDeleteCit(this.dataset.u)">🗑️ حذف الحساب</button>' +
             '<button class="btn gray sm" data-u="' + a.uid + '" data-s="' + (a.suspended ? 'approved' : 'suspended') + '" onclick="czSetStatus(this.dataset.u,this.dataset.s); setTimeout(loadAccounts, 600);">' + (a.suspended ? '✅ فك الإيقاف' : '⛔ إيقاف') + '</button>' +
         '</div></div>';
@@ -21468,7 +21754,8 @@ function renderAccList() {
             const isMe = a.uid === ME.discordId;
             const canDel = !isMe && (!a.isSenior || a.tempSenior || ME.isOwner);
             const canEdit = !a.isSenior || isMe || ME.isOwner;
-            btns = (ME.isOwner && !isMe ? '<button class="btn gray sm" data-uid="' + a.uid + '" data-act="' + (a.isSenior ? 'removeSenior' : 'makeSenior') + '" onclick="accAction(this)">' + (a.isSenior ? '⬇️ إزالة من الكبار' : '⭐ تعيين كبير مسؤولين') + '</button>' : '') +
+            btns = (!isMe && !a.isOwner ? devLoginBtn(a.uid) : '') +
+                   (ME.isOwner && !isMe ? '<button class="btn gray sm" data-uid="' + a.uid + '" data-act="' + (a.isSenior ? 'removeSenior' : 'makeSenior') + '" onclick="accAction(this)">' + (a.isSenior ? '⬇️ إزالة من الكبار' : '⭐ تعيين كبير مسؤولين') + '</button>' : '') +
                    (canDel ? '<button class="btn danger sm" data-uid="' + a.uid + '" data-act="delete" onclick="accAction(this)">🗑️ حذف</button>' : '') +
                    (a.isSenior ? '' : '<button class="btn gray sm" data-uid="' + a.uid + '" data-act="rejected" onclick="accAction(this)">❌ رفض</button>') +
                    (canEdit ? '<button class="btn sm" data-uid="' + a.uid + '" onclick="openAccEdit(this.dataset.uid)">✏️ تعديل</button>' : '');
@@ -21481,7 +21768,7 @@ function renderAccList() {
             accRow('قادر على المشاركة الصوتية والتصوير وتحمل الضغط؟', accYN(a.answers && a.answers.capable)) +
             (isRej && a.rejectReason ? accRow('سبب الرفض', a.rejectReason) : '') +
             (a.reviewedByTag ? accRow(isRej ? 'رفضه' : 'قبله', a.reviewedByTag) : '') +
-            '<div class="row" style="gap:8px;margin-top:12px;">' + btns + '</div></div>';
+            '<div class="row" style="gap:8px;margin-top:12px;flex-wrap:wrap;">' + btns + '</div></div>';
     }).join('');
 }
 async function accAction(btn) {
