@@ -105,9 +105,6 @@ const CONFIG = {
     FP_HOLD_SECONDS: 3,      // مدة الضغط على البصمة
     FP_FAIL_RATE: 0.2,       // احتمال فشل البصمة عشوائياً (0 = ما تفشل أبداً)
     FREQ_MAX_EXTRA: 5,       // عدد الترددات الإضافية اللي يسويها الكبار
-    RECEPTION_CHANNEL_ID: process.env.RECEPTION_CHANNEL_ID || "1556661220998774905",
-    RECEPTION_START_HOUR: 14, // الاستلام من 2 العصر
-    RECEPTION_END_HOUR: 21,   // إلى 9 الليل (بتوقيت الرياض)
 
     WARNING_PENALTIES: [
         { id: "deduct5",          label: "خصم 5 نقاط",                        type: "points",  value: 5 },
@@ -244,14 +241,6 @@ const PersonnelSchema = new mongoose.Schema({
     isBlocked: { type: Boolean, default: false },
     blockUntil: { type: Date, default: null },
     isDismissed: { type: Boolean, default: false },
-    excusedAbsences: [{
-        excuseId: String, type: { type: String },
-        absenceAt: Date, approvedAt: Date, approvedByName: String,
-    }],
-    removedAbsences: [{
-        dayKey: Number, absenceAt: Date, removedAt: Date, removedByName: String,
-        refunded: { type: Number, default: 0 },
-    }],
     leaveBalance: { type: Number, default: 10 },
     cardNumber: { type: String, default: null, index: true },
     cardPhotoV: { type: Number, default: 0 },
@@ -750,7 +739,6 @@ const SettingsSchema = new mongoose.Schema({
     officerTrainers: { type: [String], default: [] },
     notifTitle: { type: String, default: null },
     notifBody: { type: String, default: null },
-    receptionOfficers: { type: [{ id: String, name: String }], default: [] },
     supportCanned: { type: [{ title: String, text: String }], default: [] },
     attConfig: { type: mongoose.Schema.Types.Mixed, default: null },
     vapid: { type: mongoose.Schema.Types.Mixed, default: null },
@@ -3101,7 +3089,6 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         unlockAt: p.summon.unlockAt, enteredAt: p.summon.enteredAt,
     } : null;
 
-    const recState = (isReceptionOfficer(req.user.id, settings) || senior) ? await getReceptionState() : { open: null };
     const [meAtt, mePwaDoc, meCourt, meCyber, meDevLocked, meUnassigned, meAcc] = await Promise.all([
         getAttState(req.user.id),
         PwaInstall.exists({ uid: req.user.id }),
@@ -3117,8 +3104,6 @@ app.get("/api/me", ensureAuth, async (req, res) => {
     res.json({
         blocked: false,
         att: meAtt, attRequired: attRequired(req.user.id), pwaInstalled: mePwa,
-        isReceptionOfficer: isReceptionOfficer(req.user.id, settings) || senior,
-        receptionOpen: recState.open,
         courtStaff: meCourt.staff, courtLeader: meCourt.leader, courtLocked: !!courtCaseOf(req.user.id), courtCase: courtCaseOf(req.user.id), courtSoon: courtSoonOf(req.user.id),
         discordId: req.user.id,
         discordTag: req.user.username,
@@ -3143,8 +3128,6 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         points: p.points,
         leaveBalance: p.leaveBalance ?? CONFIG.DEFAULT_LEAVE_BALANCE,
         notes: p.notes,
-        excusedAbsences: p.excusedAbsences || [],
-        removedAbsences: p.removedAbsences || [],
         isBlocked: p.isBlocked,
         isAdmin,
         isSeniorAdmin: senior,
@@ -4449,10 +4432,9 @@ app.get("/api/senior/personnel/:discord/file", ensureSeniorAdmin, async (req, re
     const p = await Personnel.findOne({ discord: req.params.discord });
     if (!p) return res.status(404).json({ error: "غير موجود" });
     const progress = await rankProgress(p, await getSettings());
-    const [acc, att, recRows] = await Promise.all([
+    const [acc, att] = await Promise.all([
         Account.findOne({ uid: p.discord }).lean(),
         AttStatus.findOne({ uid: p.discord }).lean(),
-        RecRow.find({ uid: p.discord }).sort({ openedAt: -1, dayKey: -1 }).limit(300).lean(),
     ]);
     let account = null;
     if (acc) {
@@ -4466,15 +4448,8 @@ app.get("/api/senior/personnel/:discord/file", ensureSeniorAdmin, async (req, re
         };
     }
     const attendance = att ? { status: att.status, lastCheckInAt: att.lastCheckInAt || null, lastCheckOutAt: att.lastCheckOutAt || null } : null;
-    const receipts = recRows.map(r => ({ dayKey: r.dayKey, openedAt: r.openedAt, kind: r.kind, gained: r.gained || 0, deducted: r.deducted || 0, refunded: r.refunded || 0, excuseStatus: r.excuseStatus || "none", removed: !!r.removedAt }));
-    const receiptStats = {
-        total: receipts.length,
-        attended: receipts.filter(r => r.kind === "attended").length,
-        absent: receipts.filter(r => r.kind === "absent").length,
-        leave: receipts.filter(r => r.kind === "leave").length,
-    };
     const certs = await certListFor(p.discord).catch(() => []);
-    res.json({ personnel: p, progress, account, attendance, receipts, receiptStats, certs });
+    res.json({ personnel: p, progress, account, attendance, certs });
 });
 
 app.post("/api/senior/personnel/:discord/note", ensureSeniorAdmin, async (req, res) => {
@@ -8115,7 +8090,6 @@ const SUPPORT_CATS = {
     account: { title: "معلومات الحساب", keys: ["account.name", "account.email", "account.password", "account.age", "account.nationality", "account.status", "account.sector", "account.created"] },
     attendance: { title: "عدد الانصراف", keys: ["attn.outs", "attn.ins", "attn.status", "attn.lastIn", "attn.lastOut"] },
     file: { title: "معلومات الملف العسكري", keys: ["file.name", "file.unit", "file.rank", "file.points", "file.sector", "file.card", "file.leave", "file.warns", "file.blocked"] },
-    receipt: { title: "آخر استلام", keys: ["rec.date", "rec.result", "rec.attended", "rec.absent", "rec.leave"] },
     log: { title: "لوق العضو", keys: [] },
 };
 const SUPPORT_FIXED_KEYS = [].concat(...Object.values(SUPPORT_CATS).map(c => c.keys));
@@ -8161,17 +8135,6 @@ async function supportCatRows(cat, uid, opts) {
         rows.push(R("file.name", "الاسم المسجّل", p.registeredName), R("file.unit", "اليونت", p.unit), R("file.rank", "الرتبة", p.rank),
             R("file.points", "النقاط", p.points), R("file.sector", "القطاع", CONFIG.SECTORS[sec] || "—"), R("file.card", "رقم البطاقة", p.cardNumber),
             R("file.leave", "رصيد الإجازات", p.leaveBalance), R("file.warns", "عدد التحذيرات", (p.warnings || []).length), R("file.blocked", "موقوف (بند)", yn(p.isBlocked)));
-    } else if (cat === "receipt") {
-        const [last, grp] = await Promise.all([
-            RecRow.findOne({ uid }).sort({ openedAt: -1, dayKey: -1 }).lean(),
-            RecRow.aggregate([{ $match: { uid } }, { $group: { _id: "$kind", n: { $sum: 1 } } }]).option({ maxTimeMS: 10000 }),
-        ]);
-        if (!last) return [R("rec.date", "الاستلام", "ما له أي استلام")].filter(r => !only || only.has(r.k));
-        const ex = last.excuseStatus === "accepted" || last.removedAt ? " (انشال الغياب)" : last.excuseStatus === "pending" ? " (عذر معلّق)" : last.excuseStatus === "rejected" ? " (عذر مرفوض)" : "";
-        const result = last.kind === "attended" ? "حضر (+" + (last.gained || 1) + ")" : last.kind === "leave" ? "إجازة" : "غاب" + (last.deducted ? " (-" + last.deducted + ")" : "") + ex;
-        const cnt = kind => (grp.find(g => g._id === kind) || {}).n || 0;
-        rows.push(D("rec.date", "تاريخ آخر استلام", last.openedAt || last.dayKey), R("rec.result", "النتيجة", result),
-            R("rec.attended", "إجمالي الحضور", cnt("attended")), R("rec.absent", "إجمالي الغياب", cnt("absent")), R("rec.leave", "إجمالي الإجازة", cnt("leave")));
     } else if (cat === "log") {
         const ids = only ? Array.from(only).filter(k => SUPPORT_DYN_KEY.test(k)) : null;
         const logIds = ids ? ids.filter(k => k.startsWith("log:")).map(k => k.slice(4)) : null;
@@ -10737,10 +10700,8 @@ function ensureVapid() {
 function pushUrlFor(tag) {
     const t = String(tag || "");
     if (!t) return "/";
-    if (t === "reception" || t === "att-note") return "/?go=att";
+    if (t === "att-note") return "/?go=att";
     if (t.startsWith("att-over-")) return "/?go=hcatt";
-    if (t === "recabs" || t.startsWith("rmabs-") || t.startsWith("excuse-res-")) return "/?go=excuse";
-    if (t.startsWith("excuse-hc-")) return "/?go=hcexcuse";
     if (t === "court" || t === "court-soon" || t === "court-req" || t === "unkick") return "/?go=court";
     if (t.startsWith("warn-")) return "/?go=warn";
     if (t.startsWith("fraud-")) return "/?go=fraud";
@@ -10789,11 +10750,6 @@ const FlNotif = mongoose.model("FlNotif", new mongoose.Schema({
 const FL_NOTIF_KINDS = [
     ["att-over-",   "warning", "🚨 تجاوز الحضور"],        // برتقالي → يودّي لتجاوز الحضور
     ["att-note",    "warning", "⏱️ نسيت الانصراف"],
-    ["recabs",      "warning", "❌ غياب عن الاستلام"],
-    ["rmabs-",      "warning", "❌ غياب عن الاستلام"],
-    ["excuse-res-", "info",    "🩺 قرار العذر"],
-    ["excuse-hc-",  "info",    "🩺 عذر ينتظر قرارك"],
-    ["excuse-",     "info",    "🩺 عذر غياب جديد"],
     ["court-soon",  "warning", "⚖️ موعد تحقيق"],
     ["court-req",   "info",    "⚖️ طلب تحقيق"],
     ["court",       "danger",  "⚖️ مطلوب للتحقيق الحين"],  // أحمر منبثق
@@ -11142,10 +11098,6 @@ app.get("/api/att-view", ensureAttViewer, async (req, res) => {
                 out.sectors.push({ key, label: CONFIG.SECTORS[key], present: members.filter(m => m.status === "in").length, members });
             }
         }
-        // غياب اليوم (آخر استلام اليوم): للشرطة كل القطاعات، وللقادة قطاعاتهم
-        const absKeys = sc.absentTodayOnly ? Object.keys(CONFIG.SECTORS) : fullSectors;
-        const rows = await RecRow.find({ dayKey: { $gte: ds.getTime() }, kind: "absent", removedAt: null, sectorKey: { $in: absKeys } }).sort({ sectorKey: 1, name: 1 }).limit(2000).maxTimeMS(10000).lean();
-        out.absentToday = rows.map(r => ({ uid: r.uid, name: r.name, unit: r.unit, rank: r.rank, sector: r.sector, excuseStatus: r.excuseStatus }));
         res.json(out);
     } catch (e) {
         console.error("❌ att-view:", e.message);
@@ -11238,56 +11190,6 @@ app.get("/api/senior/att/hours", ensureSeniorAdmin, async (req, res) => {
         return { uid: r.uid, name: p.name || r.uid, unit: p.unit || null, rank: p.rank || null, sector: p.sectorLabel || null, ms: r.ms, days: r.days };
     });
     res.json({ period, list, totalMs, count: rows.length });
-});
-app.get("/api/senior/att/absent", ensureSeniorAdmin, async (req, res) => {
-    const d = parseInt(req.query.days, 10);
-    const days = [1, 3, 7, 14].includes(d) ? d : 3;
-    const now = new Date();
-    if (days === 1) {
-        const rd = await RecDay.findOne({ openedAt: { $gte: attDayStart(now) }, status: { $ne: "open" } }).sort({ openedAt: -1 }).lean();
-        if (rd) {
-            const rows = await RecRow.find({ dayKey: rd.dayKey }).limit(5000).maxTimeMS(10000).lean();
-            const slim = r => ({ uid: r.uid, name: r.name, unit: r.unit, rank: r.rank, sector: r.sector, deducted: r.deducted, refunded: r.refunded, excuseStatus: r.excuseStatus, onLeave: r.kind === "leave", lastCheckInAt: null });
-            const byName = (a, b) => String(a.name || "").localeCompare(String(b.name || ""), "ar");
-            const attended = rows.filter(r => r.kind === "attended").map(slim).sort(byName);
-            const absentRows = rows.filter(r => r.kind === "absent").map(slim).sort(byName);
-            const leaveRows = rows.filter(r => r.kind === "leave").map(slim).sort(byName);
-            return res.json({
-                days, total: rows.length, absentCount: absentRows.length,
-                reception: { dayKey: rd.dayKey, openedAt: rd.openedAt, openedByName: rd.openedByName, closedAt: rd.closedAt || null, closedByName: rd.closedByName || null, attendedCount: attended.length, absentCount: absentRows.length, leaveCount: leaveRows.length },
-                attended, list: absentRows.concat(leaveRows),
-            });
-        }
-    }
-    const since = new Date(attDayStart(now).getTime() - (days - 1) * ATT_DAY_MS);
-    const [accs, ps, sts, leaves] = await Promise.all([
-        Account.find({ status: "approved" }, { uid: 1, fullName: 1, sector: 1, isSenior: 1, isOwner: 1, tempSenior: 1 }).limit(5000).maxTimeMS(10000).lean(),
-        Personnel.find({}, { discord: 1, registeredName: 1, unit: 1, rank: 1, sector: 1, isDismissed: 1 }).limit(5000).maxTimeMS(10000).lean(),
-        AttStatus.find({}, { uid: 1, status: 1, lastCheckInAt: 1 }).limit(5000).maxTimeMS(10000).lean(),
-        LeaveRequest.find({ status: "approved" }, { discord: 1, endDate: 1 }).limit(5000).maxTimeMS(10000).lean(),
-    ]);
-    const pm = new Map(ps.map(p => [p.discord, p]));
-    const sm = new Map(sts.map(s => [s.uid, s]));
-    const lv = new Set(leaves.filter(l => !l.endDate || l.endDate > now).map(l => l.discord));
-    const universe = accs.filter(a => !a.isSenior && !a.isOwner && !a.tempSenior && !isSeniorAdmin(a.uid) && !(pm.get(a.uid) || {}).isDismissed);
-    const list = [];
-    for (const a of universe) {
-        const st = sm.get(a.uid);
-        if (st && (st.status === "in" || (st.lastCheckInAt && st.lastCheckInAt >= since))) continue;
-        const p = pm.get(a.uid) || {};
-        const key = a.sector || p.sector || null;
-        list.push({
-            uid: a.uid,
-            name: p.registeredName || a.fullName || a.uid,
-            unit: p.unit || null,
-            rank: p.rank || null,
-            sector: key ? (CONFIG.SECTORS[key] || null) : null,
-            lastCheckInAt: st ? st.lastCheckInAt : null,
-            onLeave: lv.has(a.uid),
-        });
-    }
-    list.sort((x, y) => (x.lastCheckInAt ? x.lastCheckInAt.getTime() : 0) - (y.lastCheckInAt ? y.lastCheckInAt.getTime() : 0));
-    res.json({ days, total: universe.length, absentCount: list.length, list: list.slice(0, 400) });
 });
 app.get("/api/senior/att/sectors", ensureSeniorAdmin, async (req, res) => {
     const now = new Date(), ds = attDayStart(now);
@@ -11513,492 +11415,7 @@ app.post("/api/hc/att-violations/:id/decide", ensureHighCommand, async (req, res
 });
 
 
-const RecDay = mongoose.model("RecDay", new mongoose.Schema({
-    dayKey: { type: Number, unique: true }, openedAt: Date, openedBy: String, openedByName: String,
-    status: { type: String, default: "closed" }, // open = الاستلام مفتوح الحين • closed = انسكّر وانحسبت الغيابات
-    closedAt: Date, closedBy: String, closedByName: String,
-}));
-const RecRowSchema = new mongoose.Schema({
-    dayKey: { type: Number, index: true }, uid: String, name: String, unit: String, rank: String,
-    sector: String, sectorKey: String, kind: String,
-    gained: { type: Number, default: 0 }, deducted: { type: Number, default: 0 }, refunded: { type: Number, default: 0 },
-    excuseStatus: { type: String, default: "none" }, excuseId: { type: String, default: null }, openedAt: Date,
-    removedAt: Date, removedBy: String, removedByName: String,
-    // حماية الاستلام: watch = ينتظر مؤقت الـ 8 ساعات • ok = سجّل مخالفة صالحة • absent = انقلب غياب • exempt = معفى (موقوف/مفصول/بطاقة ملغاة)
-    protStatus: { type: String, default: null }, protDeadline: Date, protCheckedAt: Date,
-});
-RecRowSchema.index({ dayKey: 1, uid: 1 }, { unique: true });
-RecRowSchema.index({ protStatus: 1, protDeadline: 1 });
-const RecRow = mongoose.model("RecRow", RecRowSchema);
-const AbsenceExcuseSchema = new mongoose.Schema({
-    rowId: String, dayKey: Number, uid: String, name: String, unit: String, rank: String, sector: String, sectorKey: String,
-    type: { type: String, enum: ["medical", "nonmedical"], default: "nonmedical" },
-    reason: String, proof: { type: String, default: null }, proofChannelId: { type: String, default: null }, proofMessageId: { type: String, default: null }, hasProof: { type: Boolean, default: false },
-    status: { type: String, enum: ["pending", "deciding", "accepted", "rejected"], default: "pending" },
-    rejectReason: { type: String, default: null }, absenceAt: Date,
-    oathText: { type: String, default: null },
-    audio: { type: Buffer, default: undefined }, audioChannelId: { type: String, default: null }, audioMessageId: { type: String, default: null },
-    audioMime: { type: String, default: null }, audioDuration: { type: Number, default: null }, audioWave: { type: String, default: null }, hasAudio: { type: Boolean, default: false },
-    decidedBy: String, decidedByName: String, decidedAt: Date, refunded: { type: Number, default: 0 },
-    createdAt: { type: Date, default: Date.now },
-});
-AbsenceExcuseSchema.index({ uid: 1, createdAt: -1 });
-const AbsenceExcuse = mongoose.model("AbsenceExcuse", AbsenceExcuseSchema);
-
-const EXCUSE_WINDOW_DAYS = 14;
-const EXCUSE_TYPE_LABEL = { medical: "طبي", nonmedical: "بدون طبي" };
-
-// فتح الاستلام: بس يسجّل إنه مفتوح (ما يحسب غياب الحين)
-async function openReceptionDay(openerId, openerName) {
-    const now = new Date();
-    const dayKey = now.getTime(); // كل استلام له مفتاح خاص (يتكرر باليوم أكثر من مرة)
-    try { await RecDay.create({ dayKey, openedAt: now, openedBy: openerId, openedByName: openerName, status: "open" }); }
-    catch (e) { return null; }
-    return { dayKey, openedAt: now };
-}
-
-// حالة الاستلام اليوم (مفتوح الحين؟ / انتهى اليوم؟) — ولو في استلام قديم نسوا يسكرونه ينسكّر بدون حساب
-async function getReceptionState() {
-    const now = new Date();
-    await RecDay.updateMany({ status: "open", openedAt: { $lt: attDayStart(now) } }, { $set: { status: "closed", closedAt: now, closedByName: "تلقائي" } }).catch(() => {});
-    const rd = await RecDay.findOne({ status: "open" }, { openedAt: 1, openedByName: 1 }).sort({ openedAt: -1 }).lean();
-    return { open: rd ? { openedAt: rd.openedAt, openedByName: rd.openedByName } : null };
-}
-
-// إغلاق الاستلام: هنا بس يحسب الحضور والغياب وقتها
-async function closeReceptionDay(closerId, closerName) {
-    const now = new Date();
-    const rd = await RecDay.findOneAndUpdate(
-        { status: "open" },
-        { $set: { status: "closed", closedAt: now, closedBy: closerId, closedByName: closerName } },
-        { new: true, sort: { openedAt: -1 } }
-    );
-    if (!rd) return null;
-    const dayKey = rd.dayKey;
-    const settings = await getSettings();
-    const [accs, ps, sts, leaves] = await Promise.all([
-        Account.find({ status: "approved" }, { uid: 1, sector: 1, isSenior: 1, isOwner: 1, tempSenior: 1 }).limit(5000).maxTimeMS(10000).lean(),
-        Personnel.find({}, { discord: 1, registeredName: 1, unit: 1, rank: 1, sector: 1, points: 1, isDismissed: 1, isBlocked: 1 }).limit(5000).maxTimeMS(10000).lean(),
-        AttStatus.find({}, { uid: 1, status: 1 }).limit(5000).maxTimeMS(10000).lean(),
-        LeaveRequest.find({ status: "approved" }, { discord: 1, endDate: 1 }).limit(5000).maxTimeMS(10000).lean(),
-    ]);
-    const pm = new Map(ps.map(p => [p.discord, p]));
-    const sm = new Map(sts.map(s => [s.uid, s]));
-    const lv = new Set(leaves.filter(l => !l.endDate || l.endDate > now).map(l => l.discord));
-    // اللي حضر وقعد 15 دقيقة على الأقل بعد فتح الاستلام وسوا انصراف قبل الإغلاق = يحسب حاضر (مو غياب)
-    const REC_MIN_STAY_MS = 15 * 60 * 1000;
-    const stayed = new Set();
-    try {
-        const winS = new Date(rd.openedAt).getTime(), winE = now.getTime();
-        const logs = await AttLog.find({ at: { $gte: new Date(winS - ATT_SESSION_CAP) } }, { uid: 1, type: 1, at: 1 }).sort({ at: 1 }).limit(60000).maxTimeMS(10000).lean();
-        const cur = new Map();
-        for (const l of logs) {
-            const tt = new Date(l.at).getTime();
-            if (l.type === "in") { if (!cur.has(l.uid)) cur.set(l.uid, tt); }
-            else if (l.type === "out") {
-                const s0 = cur.get(l.uid);
-                if (s0 !== undefined) {
-                    const ov = Math.min(tt, winE) - Math.max(s0, tt - ATT_SESSION_CAP, winS);
-                    if (ov >= REC_MIN_STAY_MS) stayed.add(l.uid);
-                    cur.delete(l.uid);
-                }
-            }
-        }
-    } catch (e) { console.error("❌ فشل حساب مدة بقاء الاستلام:", e.message); }
-    // الاستلام مرة وحدة باليوم: اللي حضر استلام سابق اليوم ما ينحسب عليه غياب بهذا الاستلام (ولو حضر ياخذ نقطته عادي)
-    const attendedEarlier = new Set();
-    try {
-        const earlier = await RecDay.find({ dayKey: { $ne: dayKey }, openedAt: { $gte: attDayStart(rd.openedAt), $lt: rd.openedAt } }, { dayKey: 1 }).lean();
-        if (earlier.length) {
-            const prev = await RecRow.find({ dayKey: { $in: earlier.map(e => e.dayKey) }, kind: "attended", removedAt: null }, { uid: 1 }).limit(20000).maxTimeMS(10000).lean();
-            prev.forEach(r => attendedEarlier.add(r.uid));
-        }
-    } catch (e) { console.error("❌ فشل جلب حضور الاستلامات السابقة:", e.message); }
-    const protDeadline = new Date(now.getTime() + REC_PROT_MS);
-    const rows = [], ops = [];
-    let attended = 0, absent = 0, leave = 0, skippedEarlier = 0;
-    for (const a of accs) {
-        if (a.isSenior || a.isOwner || a.tempSenior || isSeniorAdmin(a.uid) || isHighCommand(a.uid, settings)) continue;
-        const p = pm.get(a.uid);
-        if (!p || !p.registeredName || p.isDismissed || p.isBlocked) continue;
-        const key = a.sector || p.sector || null;
-        if (!p.unit || !key) continue;
-        const st = sm.get(a.uid);
-        const base = { dayKey, uid: a.uid, name: p.registeredName, unit: p.unit, rank: p.rank, sector: CONFIG.SECTORS[key] || null, sectorKey: key, openedAt: rd.openedAt };
-        if ((st && st.status === "in") || stayed.has(a.uid)) {
-            // اللي مسجّل حضور وقت انتهاء الاستلام يبدأ له مؤقت 8 ساعات (حماية: لازم يسجّل مخالفة صالحة)
-            const watch = !!(st && st.status === "in");
-            rows.push({ ...base, kind: "attended", gained: 1, ...(watch ? { protStatus: "watch", protDeadline } : {}) });
-            ops.push({ updateOne: { filter: { discord: a.uid }, update: { $inc: { points: 1 } } } });
-            attended++;
-        } else if (attendedEarlier.has(a.uid)) {
-            skippedEarlier++;   // حضر استلام سابق اليوم: هذا الاستلام ما يحسب عليه
-        } else if (lv.has(a.uid)) {
-            rows.push({ ...base, kind: "leave" });
-            leave++;
-        } else {
-            const ded = 5; // خصم ثابت خمس نقاط حتى لو رصيده 0 أو 1 (يصير بالسالب)
-            rows.push({ ...base, kind: "absent", deducted: ded, excuseStatus: "none" });
-            if (ded) ops.push({ updateOne: { filter: { discord: a.uid }, update: { $inc: { points: -ded } } } });
-            absent++;
-        }
-    }
-    if (rows.length) await RecRow.insertMany(rows, { ordered: false }).catch(e => console.error("❌ فشل حفظ حضور الاستلام:", e.message));
-    if (ops.length) await Personnel.bulkWrite(ops, { ordered: false }).catch(e => console.error("❌ فشل تحديث نقاط الاستلام:", e.message));
-    (async () => {
-        for (const r of rows) {
-            if (r.kind !== "absent") continue;
-            await pushUid(r.uid, { title: CONFIG.SITE_NAME, body: "غبت عن الاستلام" + (r.deducted ? " وانخصم عليك " + r.deducted + " نقطة" : "") + " — تقدر تقدم عذر من صفحة غياب بعذر", ttl: 3600, tag: "recabs" }).catch(() => {});
-        }
-    })();
-    await logEvent({ action: "إغلاق استلام وحساب الغيابات", actorId: closerId, details: "حضروا " + attended + " (+1) • غابوا " + absent + " (-5) • إجازة " + leave + (skippedEarlier ? " • ما انحسب عليهم (حضروا استلام سابق اليوم) " + skippedEarlier : "") });
-    return { attended, absent, leave };
-}
-
-// ═══ حماية الاستلام ═══
-// اللي انحسب حاضر وهو مسجّل حضور وقت انتهاء الاستلام: يبدأ له مؤقت 8 ساعات.
-// لو ما سجّل ولا مخالفة صالحة خلالها => ينقلب حضوره غياب (تنسحب نقطة الحضور وينخصم 5).
-// المخالفة المرفوضة تعتبر كأنها ما انسجلت، والمعلّقة ننتظر قرارها.
-const REC_PROT_MS = 8 * 60 * 60 * 1000;
-let recProtBusy = false;
-async function runRecProtection() {
-    if (recProtBusy) return;
-    recProtBusy = true;
-    try {
-        const now = new Date();
-        const due = await RecRow.find({ kind: "attended", protStatus: "watch", protDeadline: { $lte: now }, removedAt: null }).limit(300).maxTimeMS(10000).lean();
-        if (!due.length) return;
-        const settings = await getSettings();
-        if (settings.disableViolations) {   // تسجيل المخالفات مقفل: ما نظلم أحد، نأجّل ساعة
-            await RecRow.updateMany({ _id: { $in: due.map(r => r._id) } }, { $set: { protDeadline: new Date(now.getTime() + 60 * 60 * 1000) } });
-            return;
-        }
-        const uids = [...new Set(due.map(r => r.uid))];
-        const since = new Date(Math.min(...due.map(r => new Date(r.openedAt).getTime())));
-        const [vs, ps] = await Promise.all([
-            Violation.find({ reporterDiscord: { $in: uids }, createdAt: { $gte: since } }, { reporterDiscord: 1, createdAt: 1, status: 1 }).limit(20000).maxTimeMS(10000).lean(),
-            Personnel.find({ discord: { $in: uids } }, { discord: 1, isBlocked: 1, isDismissed: 1, cardRevoked: 1 }).maxTimeMS(10000).lean(),
-        ]);
-        const pm = new Map(ps.map(p => [p.discord, p]));
-        const ops = [], flipped = [];
-        for (const row of due) {
-            const from = new Date(row.openedAt).getTime(), to = new Date(row.protDeadline).getTime();
-            const mine = vs.filter(v => v.reporterDiscord === row.uid && new Date(v.createdAt).getTime() >= from && new Date(v.createdAt).getTime() <= to);
-            if (mine.some(v => v.status !== "pending" && v.status !== "rejected")) {
-                await RecRow.updateOne({ _id: row._id, protStatus: "watch" }, { $set: { protStatus: "ok", protCheckedAt: now } });
-                continue;
-            }
-            if (mine.some(v => v.status === "pending")) {   // لسا ما انقرر عليها: ننتظر
-                await RecRow.updateOne({ _id: row._id }, { $set: { protCheckedAt: now } });
-                continue;
-            }
-            const p = pm.get(row.uid);
-            if (!p || p.isBlocked || p.isDismissed || p.cardRevoked) {   // ما يقدر يسجّل مخالفات أصلاً: معفى
-                await RecRow.updateOne({ _id: row._id, protStatus: "watch" }, { $set: { protStatus: "exempt", protCheckedAt: now } });
-                continue;
-            }
-            const r0 = await RecRow.findOneAndUpdate(
-                { _id: row._id, kind: "attended", protStatus: "watch", removedAt: null },
-                { $set: { kind: "absent", gained: 0, deducted: 5, excuseStatus: "none", protStatus: "absent", protCheckedAt: now } }
-            );
-            if (!r0) continue;
-            ops.push({ updateOne: { filter: { discord: row.uid }, update: { $inc: { points: -6 } } } });   // سحب نقطة الحضور + خصم 5
-            flipped.push(row);
-        }
-        if (ops.length) await Personnel.bulkWrite(ops, { ordered: false }).catch(e => console.error("❌ فشل خصم حماية الاستلام:", e.message));
-        for (const r of flipped) {
-            await pushUid(r.uid, { title: CONFIG.SITE_NAME, body: "انحسب عليك غياب عن الاستلام: ما سجّلت أي مخالفة صالحة خلال 8 ساعات من انتهاءه (المرفوضة ما تنحسب). انسحبت نقطة الحضور وانخصم عليك 5 نقاط — تقدر تقدم عذر من صفحة غياب بعذر", ttl: 3600, tag: "recabs" }).catch(() => {});
-        }
-        if (flipped.length) await logEvent({ action: "حماية الاستلام: تحويل حضور لغياب", actorId: "auto", actorTag: "🤖 نظام حماية الاستلام", details: "انقلب غياب لعدم تسجيل مخالفة صالحة خلال 8 ساعات: " + flipped.map(r => r.name).join("، ") });
-    } catch (e) { console.error("❌ حماية الاستلام:", e.message); }
-    finally { recProtBusy = false; }
-}
-setInterval(() => { runRecProtection(); }, 5 * 60 * 1000).unref();
-setTimeout(() => { runRecProtection(); }, 90 * 1000).unref();
-
-app.get("/api/excuse/my", ensureAuth, async (req, res) => {
-    const since = attDayStart(new Date()).getTime() - (EXCUSE_WINDOW_DAYS - 1) * ATT_DAY_MS;
-    const rows = await RecRow.find({ uid: req.user.id, kind: "absent", dayKey: { $gte: since } }).sort({ dayKey: -1 }).limit(60).lean();
-    const ids = rows.map(r => r.excuseId).filter(Boolean);
-    const exs = ids.length ? await AbsenceExcuse.find({ _id: { $in: ids } }, { proof: 0, audio: 0 }).lean() : [];
-    const em = new Map(exs.map(e => [String(e._id), e]));
-    res.json({
-        list: rows.map(r => {
-            const e = r.excuseId ? em.get(String(r.excuseId)) : null;
-            return {
-                rowId: String(r._id), openedAt: r.openedAt, deducted: r.deducted, refunded: r.refunded, excuseStatus: r.excuseStatus,
-                excuse: e ? { type: e.type, reason: e.reason, status: e.status, rejectReason: e.rejectReason, createdAt: e.createdAt, decidedAt: e.decidedAt, hasProof: !!e.hasProof } : null,
-            };
-        }),
-    });
-});
-
-app.post("/api/excuse/submit", ensureAuth, async (req, res) => {
-    const b = req.body || {};
-    const rowId = String(b.rowId || "");
-    const reason = String(b.reason || "").trim().slice(0, 500);
-    const type = b.type === "medical" ? "medical" : b.type === "nonmedical" ? "nonmedical" : null;
-    if (!mongoose.Types.ObjectId.isValid(rowId)) return res.status(404).json({ error: "غير موجود" });
-    if (reason.length < 3) return res.status(400).json({ error: "اكتب العذر" });
-    if (!type) return res.status(400).json({ error: "حدد نوع العذر (طبي أو بدون طبي)" });
-    let proof = null;
-    if (!b.proof) return res.status(400).json({ error: "لازم ترفق دليل (صورة) للعذر" });
-    proof = String(b.proof);
-    if (!/^data:image\/(jpeg|png|webp);base64,/.test(proof) || proof.length > 2500000) return res.status(400).json({ error: "الدليل لازم يكون صورة وحجمها صغير" });
-    if (b.oath !== true) return res.status(400).json({ error: "لازم توافق على القسم وتقوله" });
-    const audioIn = supportCleanAudio(b);
-    if (!audioIn) return res.status(400).json({ error: "لازم تسجّل القسم بصوتك (تسجيل صوتي صالح)" });
-    let proofCh = null, proofMsg = null;
-    if (proof) {
-        const up = await discordSaveImage(proof, "excuse");
-        if (up) { proofCh = up.channelId; proofMsg = up.messageId; proof = null; }
-    }
-    const hadProof = !!(proof || proofMsg);
-    const audioFields = await supportAudioFields(audioIn);
-    const since = attDayStart(new Date()).getTime() - (EXCUSE_WINDOW_DAYS - 1) * ATT_DAY_MS;
-    const row = await RecRow.findOneAndUpdate(
-        { _id: rowId, uid: req.user.id, kind: "absent", excuseStatus: "none", dayKey: { $gte: since } },
-        { $set: { excuseStatus: "pending" } }, { new: true });
-    if (!row) return res.status(409).json({ error: "ما تقدر تقدم عذر على هذا الغياب" });
-    let ex;
-    try {
-        ex = await AbsenceExcuse.create({
-            rowId: String(row._id), dayKey: row.dayKey, uid: row.uid, name: row.name, unit: row.unit, rank: row.rank,
-            sector: row.sector, sectorKey: row.sectorKey, type, reason, proof, proofChannelId: proofCh, proofMessageId: proofMsg, hasProof: hadProof, absenceAt: row.openedAt,
-            oathText: "أُقسم بالله العظيم، أنا (" + row.name + ")، بأن العذر الذي تقدمت به بشأن غيابي وهو (" + reason + ") صحيح، وأتحمل كامل المسؤولية عن صحة ما ذكرته، وأتعهد بعدم تقديم أي عذر غير صحيح، والله على ما أقول شهيد.",
-            hasAudio: true, ...audioFields,
-        });
-        await RecRow.updateOne({ _id: row._id }, { $set: { excuseId: String(ex._id) } });
-    } catch (e) {
-        await RecRow.updateOne({ _id: row._id }, { $set: { excuseStatus: "none" } });
-        return res.status(500).json({ error: "تعذر إرسال العذر، حاول مرة ثانية" });
-    }
-    const settings = await getSettings();
-    const sec = (row.sectorKey && secLead(settings, row.sectorKey)) || {};
-    const targets = Array.from(new Set([sec.commanderId, sec.deputyId, sec.personnelOfficerId].filter(x => x && x !== req.user.id)));
-    const text = "🩺 تنبيه: العضو " + row.name + " (" + (row.rank || "-") + " • " + (row.unit || "-") + ") قدّم عذر غياب عن الاستلام — النوع: " + EXCUSE_TYPE_LABEL[type] + " — السبب: " + reason.slice(0, 150) + " — القرار عند القيادة العليا.";
-    for (const t of targets) {
-        await pushNoticeTo(t, text, "auto", "🤖 نظام الاستلام");
-        pushUid(t, { title: CONFIG.SITE_NAME, body: "🩺 عذر غياب جديد من " + row.name, ttl: 86400, tag: "excuse-" + String(ex._id) }).catch(() => {});
-    }
-    const hcIds = new Set([...(settings.highCommand || []).map(m => m.id), ...Array.from(seniorUids)]);
-    for (const id of hcIds) pushUid(id, { title: CONFIG.SITE_NAME, body: "🩺 عذر غياب جديد من " + row.name + " ينتظر قرارك", ttl: 86400, tag: "excuse-hc-" + String(ex._id) }).catch(() => {});
-    if (hcIds.size) sseBroadcast("hcalert", { t: Date.now(), exc: true }, c => !!c.uid && hcIds.has(c.uid));
-    await logEvent({ action: "تقديم عذر غياب", discordId: req.user.id, discordTag: req.user.username, actorId: req.user.id, actorTag: req.user.username, details: row.name + " — " + EXCUSE_TYPE_LABEL[type] });
-    res.json({ ok: true });
-});
-
-app.get("/api/hc/excuses", ensureHighCommand, async (req, res) => {
-    const f = String(req.query.filter || "pending");
-    const q = f === "pending" ? { status: { $in: ["pending", "deciding"] } } : { status: { $in: ["accepted", "rejected"] } };
-    const [list, pendingCount] = await Promise.all([
-        AbsenceExcuse.find(q, { proof: 0, audio: 0 }).sort({ createdAt: -1 }).limit(200).lean(),
-        AbsenceExcuse.countDocuments({ status: "pending" }),
-    ]);
-    res.json({ list, pendingCount });
-});
-app.get("/api/hc/excuses/:id/audio", ensureHighCommand, async (req, res) => {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).end();
-    const ex = await AbsenceExcuse.findById(req.params.id, { audio: 1, audioMime: 1, audioChannelId: 1, audioMessageId: 1 }).lean();
-    if (!ex) return res.status(404).end();
-    if (!(ex.audio && ex.audio.length) && ex.audioChannelId && ex.audioMessageId) {
-        try {
-            const u = await discordImageUrl(ex.audioChannelId, ex.audioMessageId, "exv:" + String(ex._id));
-            if (u) return res.redirect(u);
-        } catch (e) { console.error("❌ فشل جلب صوت القسم:", e.message); }
-        return res.status(503).end();
-    }
-    if (!(ex.audio && ex.audio.length)) return res.status(404).end();
-    const buf = Buffer.from(ex.audio.buffer ? ex.audio.buffer : ex.audio);
-    res.set({ "Content-Type": ex.audioMime || "audio/webm", "Cache-Control": "private, max-age=3600", "Content-Length": buf.length });
-    res.end(buf);
-});
-app.get("/api/hc/excuses/:id/proof", ensureHighCommand, async (req, res) => {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "غير موجود" });
-    const ex = await AbsenceExcuse.findById(req.params.id, { proof: 1, proofChannelId: 1, proofMessageId: 1 }).lean();
-    if (!ex) return res.status(404).json({ error: "ما فيه دليل" });
-    if (ex.proofChannelId && ex.proofMessageId) {
-        try {
-            const u = await discordImageUrl(ex.proofChannelId, ex.proofMessageId, "excuse:" + String(ex._id));
-            if (u) return res.json({ image: u });
-        } catch (e) {
-            console.error("❌ فشل جلب دليل العذر من ديسكورد:", e.message);
-            if (!ex.proof) return res.status(503).json({ error: "تعذر جلب الصورة من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-        }
-    }
-    if (!ex.proof) return res.status(404).json({ error: "ما فيه دليل" });
-    res.json({ image: ex.proof });
-});
-async function tellExcuseResult(ex, text) {
-    await pushNoticeTo(ex.uid, text, "auto", "🤖 نظام الاستلام");
-    pushUid(ex.uid, { title: CONFIG.SITE_NAME, body: text.slice(0, 120), ttl: 86400, tag: "excuse-res-" + String(ex._id) }).catch(() => {});
-}
-app.post("/api/hc/excuses/:id/accept", ensureHighCommand, async (req, res) => {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "غير موجود" });
-    const ex = await AbsenceExcuse.findOneAndUpdate({ _id: req.params.id, status: "pending" }, { $set: { status: "deciding" } }, { new: true });
-    if (!ex) return res.status(409).json({ error: "تم اتخاذ قرار على هذا العذر من قبل" });
-    try {
-        const row = await RecRow.findById(ex.rowId);
-        const refund = row ? (row.deducted || 0) : 0;
-        const now = new Date();
-        const byName = await cyName(req.user.id);
-        const upd = { $push: { excusedAbsences: { excuseId: String(ex._id), type: ex.type, absenceAt: row ? row.openedAt : ex.createdAt, approvedAt: now, approvedByName: byName } } };
-        if (refund) upd.$inc = { points: refund };
-        await Personnel.updateOne({ discord: ex.uid }, upd);
-        if (row) await RecRow.updateOne({ _id: row._id }, { $set: { excuseStatus: "accepted", deducted: 0, refunded: refund } });
-        await AbsenceExcuse.updateOne({ _id: ex._id }, { $set: { status: "accepted", decidedBy: req.user.id, decidedByName: byName, decidedAt: now, refunded: refund } });
-        await logEvent({ action: "قبول عذر غياب", discordId: ex.uid, actorId: req.user.id, actorTag: req.user.username, details: ex.name + (refund ? " — رجعت " + refund + " نقطة" : "") });
-        await tellExcuseResult(ex, "✅ تم قبول عذر غيابك عن الاستلام" + (refund ? " ورجعت لك " + refund + " نقطة" : "") + " — تسجّل في ملفك كغياب بعذر.");
-        res.json({ ok: true, refunded: refund });
-    } catch (e) {
-        await AbsenceExcuse.updateOne({ _id: ex._id, status: "deciding" }, { $set: { status: "pending" } });
-        res.status(400).json({ error: e.message });
-    }
-});
-app.post("/api/hc/excuses/:id/reject", ensureHighCommand, async (req, res) => {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "غير موجود" });
-    const reason = String((req.body || {}).reason || "").trim().slice(0, 300);
-    if (!reason) return res.status(400).json({ error: "اكتب سبب الرفض" });
-    const ex = await AbsenceExcuse.findOneAndUpdate({ _id: req.params.id, status: "pending" }, { $set: { status: "deciding" } }, { new: true });
-    if (!ex) return res.status(409).json({ error: "تم اتخاذ قرار على هذا العذر من قبل" });
-    try {
-        const byName = await cyName(req.user.id);
-        await RecRow.updateOne({ _id: ex.rowId }, { $set: { excuseStatus: "rejected" } });
-        await AbsenceExcuse.updateOne({ _id: ex._id }, { $set: { status: "rejected", rejectReason: reason, decidedBy: req.user.id, decidedByName: byName, decidedAt: new Date() } });
-        await logEvent({ action: "رفض عذر غياب", discordId: ex.uid, actorId: req.user.id, actorTag: req.user.username, details: ex.name + " — " + reason });
-        await tellExcuseResult(ex, "❌ تم رفض عذر غيابك عن الاستلام وتثبّت الخصم — السبب: " + reason);
-        res.json({ ok: true });
-    } catch (e) {
-        await AbsenceExcuse.updateOne({ _id: ex._id, status: "deciding" }, { $set: { status: "pending" } });
-        res.status(400).json({ error: e.message });
-    }
-});
-
-// ---------- إزالة الغياب (للمالك فقط) ----------
-app.post("/api/owner/att/remove-absence", ensureSeniorAdmin, async (req, res) => {
-    if (!isOwnerUid(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
-    const b = req.body || {};
-    const dayKey = Number(b.dayKey);
-    if (!Number.isFinite(dayKey)) return res.status(400).json({ error: "حدد الاستلام" });
-    const mode = b.mode === "all" ? "all" : b.mode === "except" ? "except" : null;
-    if (!mode) return res.status(400).json({ error: "حدد الكل أو مستثنى" });
-    // الكل = ينشال الغياب عن كل الغايبين • مستثنى = الغياب يثبت على الجميع، وينشال بس عن الأشخاص اللي تختارهم
-    const picked = new Set(mode === "except" && Array.isArray(b.exceptUids) ? b.exceptUids.map(String) : []);
-    const rd = await RecDay.findOne({ dayKey }).lean();
-    if (!rd || rd.status === "open") return res.status(409).json({ error: "الاستلام ما انسكّر بعد" });
-    const OK = ["none", "pending", "rejected"];
-    const rows = await RecRow.find({ dayKey, kind: "absent", excuseStatus: { $in: OK } }, { uid: 1 }).limit(5000).lean();
-    if (mode === "except" && !picked.size) return res.status(400).json({ error: "حدد الأشخاص اللي تبي ينشال غيابهم" });
-    const targets = mode === "except" ? rows.filter(r => picked.has(String(r.uid))) : rows;
-    if (!targets.length) return res.status(400).json({ error: "ما فيه غايبين تنشال عنهم" });
-    const now = new Date();
-    const byName = await cyName(req.user.id);
-    let removed = 0, refundedTotal = 0;
-    const done = [];
-    for (const t of targets) {
-        try {
-            const old = await RecRow.findOneAndUpdate(
-                { _id: t._id, kind: "absent", excuseStatus: { $in: OK } },
-                { $set: { excuseStatus: "removed", deducted: 0, removedAt: now, removedBy: req.user.id, removedByName: byName } },
-                { new: false }
-            );
-            if (!old) continue;
-            const ded = old.deducted || 0;
-            if (ded) await RecRow.updateOne({ _id: old._id }, { $set: { refunded: ded } });
-            if (old.excuseStatus === "pending" && old.excuseId) {
-                await AbsenceExcuse.updateOne({ _id: old.excuseId, status: "pending" }, { $set: { status: "rejected", rejectReason: "أُزيل الغياب من المالك", decidedBy: req.user.id, decidedByName: byName, decidedAt: now } });
-            }
-            const upd = { $push: { removedAbsences: { dayKey, absenceAt: old.openedAt || rd.openedAt, removedAt: now, removedByName: byName, refunded: ded } } };
-            if (ded) upd.$inc = { points: ded };
-            await Personnel.updateOne({ discord: old.uid }, upd);
-            removed++; refundedTotal += ded;
-            done.push({ uid: old.uid, name: old.name, ded });
-        } catch (e) { console.error("❌ فشل إزالة غياب:", e.message); }
-    }
-    await logEvent({ action: "إزالة غياب", actorId: req.user.id, actorTag: req.user.username, details: "أُزيل الغياب عن " + removed + " (رجعت " + refundedTotal + " نقطة)" + (mode === "except" ? " • بالاختيار" : " • الكل") });
-    (async () => {
-        for (const x of done) {
-            const text = "🧹 تم إزالة غيابك عن الاستلام" + (x.ded ? " ورجعت لك " + x.ded + " نقطة" : "") + " — وانسجّل في ملفك.";
-            await pushNoticeTo(x.uid, text, "auto", "🤖 نظام الاستلام");
-            pushUid(x.uid, { title: CONFIG.SITE_NAME, body: text.slice(0, 120), ttl: 86400, tag: "rmabs-" + dayKey }).catch(() => {});
-        }
-    })();
-    res.json({ ok: true, removed, refunded: refundedTotal, skipped: mode === "except" ? Math.max(0, rows.length - targets.length) : 0 });
-});
-
-// ---------- مسؤولو الاستلامات + زر فتح استلام ----------
-function isReceptionOfficer(uid, settings) { return !!(settings && (settings.receptionOfficers || []).some(m => m.id === uid)); }
-app.get("/api/senior/reception", ensureSeniorAdmin, async (req, res) => {
-    const s = await getSettings();
-    res.json({ list: s.receptionOfficers || [] });
-});
-app.post("/api/senior/reception/add", ensureSeniorAdmin, async (req, res) => {
-    const discordId = String((req.body || {}).discordId || "").trim();
-    if (!discordId) return res.status(400).json({ error: "حدد الشخص" });
-    const person = await Personnel.findOne({ discord: discordId });
-    if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع" });
-    const s = await getSettings();
-    if (!s.receptionOfficers) s.receptionOfficers = [];
-    if (s.receptionOfficers.some(m => m.id === person.discord)) return res.status(400).json({ error: "موجود من قبل" });
-    s.receptionOfficers.push({ id: person.discord, name: person.registeredName || person.discordTag });
-    s.markModified("receptionOfficers");
-    await s.save();
-    await logEvent({ action: "إضافة مسؤول استلامات", discordId: person.discord, discordTag: person.discordTag, actorId: req.user.id, actorTag: req.user.username, details: person.registeredName });
-    res.json({ ok: true, list: s.receptionOfficers });
-});
-app.post("/api/senior/reception/remove", ensureSeniorAdmin, async (req, res) => {
-    const discordId = String((req.body || {}).discordId || "");
-    const s = await getSettings();
-    const removed = (s.receptionOfficers || []).find(m => m.id === discordId);
-    s.receptionOfficers = (s.receptionOfficers || []).filter(m => m.id !== discordId);
-    s.markModified("receptionOfficers");
-    await s.save();
-    await logEvent({ action: "إزالة مسؤول استلامات", actorId: req.user.id, actorTag: req.user.username, details: (removed && removed.name) || discordId });
-    res.json({ ok: true, list: s.receptionOfficers });
-});
-function riyadhHour() {
-    const h = parseInt(new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Riyadh", hour: "2-digit", hour12: false }).format(new Date()), 10);
-    return h % 24;
-}
-let lastReceptionAt = 0;
-app.post("/api/reception/open", ensureAuth, async (req, res) => {
-    const settings = await getSettings();
-    const isSr = isSeniorAdmin(req.user.id); // الكبار: يفتحون الاستلام بأي وقت وبدون بصمة
-    if (!isSr && !isReceptionOfficer(req.user.id, settings)) return res.status(403).json({ error: "هذا الزر لمسؤولي الاستلامات فقط" });
-    const att = await getAttState(req.user.id);
-    if (!isSr && att.status !== "in") return res.status(403).json({ error: "🖐️ سجّل حضورك بالبصمة أول", needAttendance: true });
-    const h = riyadhHour();
-    if (!isSr && (h < CONFIG.RECEPTION_START_HOUR || h >= CONFIG.RECEPTION_END_HOUR)) return res.status(400).json({ error: "⏰ مو وقت الاستلام — الاستلام من الساعة 2 العصر إلى 9 الليل" });
-    const state = await getReceptionState();
-    if (state.open) return res.status(409).json({ error: "الاستلام مفتوح الحين", receptionOpen: state.open });
-    const opened = await openReceptionDay(req.user.id, await cyName(req.user.id));
-    if (!opened) return res.status(409).json({ error: "الاستلام انفتح قبل شوي" });
-    const r = await pushAll({ title: CONFIG.SITE_NAME, body: "استلام الان", ttl: 900, tag: "reception" });
-    let discord = false;
-    if (botReady) {
-        try {
-            const ch = await client.channels.fetch(CONFIG.RECEPTION_CHANNEL_ID);
-            await ch.send({ content: "استلام @everyone", allowedMentions: { parse: ["everyone"] } });
-            discord = true;
-        } catch (e) { console.error("❌ فشل إرسال رسالة الاستلام للديسكورد:", e.message); }
-    }
-    await logEvent({ action: "فتح استلام", actorId: req.user.id, actorTag: req.user.username, details: "إشعار وصل لـ " + r.sent + " جهاز" + (discord ? " + ديسكورد" : "") });
-    res.json({ ok: true, sent: r.sent, discord, receptionOpen: { openedAt: opened.openedAt, openedByName: await cyName(req.user.id) } });
-});
-app.post("/api/reception/close", ensureAuth, async (req, res) => {
-    const settings = await getSettings();
-    const isSr = isSeniorAdmin(req.user.id);
-    if (!isSr && !isReceptionOfficer(req.user.id, settings)) return res.status(403).json({ error: "هذا الزر لمسؤولي الاستلامات فقط" });
-    const att = await getAttState(req.user.id);
-    if (!isSr && att.status !== "in") return res.status(403).json({ error: "🖐️ سجّل حضورك بالبصمة أول", needAttendance: true });
-    const state = await getReceptionState();
-    if (!state.open) return res.status(409).json({ error: "الاستلام مو مفتوح الحين", receptionOpen: null });
-    let rec = null;
-    try { rec = await closeReceptionDay(req.user.id, await cyName(req.user.id)); }
-    catch (e) { console.error("❌ فشل إغلاق الاستلام:", e.message); return res.status(500).json({ error: "صار خطأ وقت إغلاق الاستلام" }); }
-    if (!rec) return res.status(409).json({ error: "الاستلام انسكّر قبل شوي", receptionOpen: null });
-    res.json({ ok: true, rec });
-});
+// (تم حذف نظام الاستلام والغياب والأعذار بالكامل — البصمة حضور/انصراف فقط)
 
 // ---------- تردد القطاعات المشتركة (روم صوتي 910..919) ----------
 const FreqRoom = mongoose.model("FreqRoom", new mongoose.Schema({
@@ -14859,8 +14276,6 @@ function spConnect() {
             try {
                 if (ME && document.getElementById('att-body') && typeof ATTP !== 'undefined' && ATTP.tab === 'viol') attLoad(true);
                 if (ME && document.getElementById('hc-content') && typeof hcTab !== 'undefined' && hcTab === 'att') loadHCAtt(true);
-                if (ME && document.getElementById('hc-content') && typeof hcTab !== 'undefined' && hcTab === 'exc') loadHCExcuses(true);
-                if (ME && document.getElementById('admin-content') && typeof currentAdminTab !== 'undefined' && currentAdminTab === 'excuses') loadSeniorExcuses(true);
                 if (!ME || !ME.isHighCommand) return;
                 checkPromotionAlert();
                 if (typeof hcTab !== 'undefined' && hcTab === 'pending' && document.getElementById('hc-content')) loadHCPending(true);
@@ -15739,12 +15154,12 @@ async function spDeleteTicket() {
     try { await spApi('/api/support/admin/tickets/' + c.id, { method: 'DELETE' }); toast('🗑️ تم حذف التكت'); spBack(); }
     catch (e) { toast(e.message); }
 }
-var SP_INS_CATS = [['account', '🔐 معلومات الحساب'], ['attendance', '🕒 عدد الانصراف'], ['file', '🪖 معلومات الملف العسكري'], ['receipt', '📣 آخر استلام'], ['log', '📜 آخر لوق للعضو']];
+var SP_INS_CATS = [['account', '🔐 معلومات الحساب'], ['attendance', '🕒 عدد الانصراف'], ['file', '🪖 معلومات الملف العسكري'], ['log', '📜 آخر لوق للعضو']];
 function spFmtDate(v) {
     try { return new Date(v).toLocaleString('ar-SA-u-ca-gregory', { timeZone: 'Asia/Riyadh', year: 'numeric', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }); } catch (e) { return '—'; }
 }
 function spCatOf(k) {
-    return k.indexOf('account.') === 0 ? 'account' : k.indexOf('attn.') === 0 ? 'attendance' : k.indexOf('file.') === 0 ? 'file' : k.indexOf('rec.') === 0 ? 'receipt' : 'log';
+    return k.indexOf('account.') === 0 ? 'account' : k.indexOf('attn.') === 0 ? 'attendance' : k.indexOf('file.') === 0 ? 'file' : 'log';
 }
 function spInfoRowHtml(r) {
     if (r.at) return '<div class="sp-info-r"><span>' + spEsc(r.l) + (r.v && r.v !== '—' ? ' <small style="color:var(--muted);">— ' + spEsc(r.v) + '</small>' : '') + '</span><b>' + spEsc(spFmtDate(r.at)) + '</b></div>';
@@ -16156,16 +15571,11 @@ function fnStart() {
     fnCheck();
 }
 
-// ===== تنقّل الإشعارات: ?go=att|excuse|hcexcuse|hcatt|court|warn  و ?ticket=ID =====
+// ===== تنقّل الإشعارات: ?go=att|hcatt|court|warn  و ?ticket=ID =====
 function flGoTo(code) {
     if (!ME) return false;
     try {
         if (code === 'att') { if (ME.att && ME.att.status === 'in') renderDashboard(); else renderFingerprint('checkin'); return true; }
-        if (code === 'excuse') { renderExcusePage(); return true; }
-        if (code === 'hcexcuse') {
-            if (ME.isHighCommand) { renderHighCommandPanel(); hcTabSwitch('exc', document.querySelectorAll('.tabs .tab')[3]); return true; }
-            if (ME.isSeniorAdmin) { renderAdmin('excuses'); return true; }
-        }
         if (code === 'hcatt' && ME.isHighCommand) { renderHighCommandPanel(); hcTabSwitch('att', document.querySelectorAll('.tabs .tab')[2]); return true; }
         if (code === 'court' && ME.courtStaff) { renderCourtPanel(); return true; }
         if (code === 'fraud' && ME.canFraud) { renderFraudPanel(); return true; }
@@ -16817,12 +16227,36 @@ function czInjectStyle() {
         '.cz-mil-badge{margin-right:auto;padding:4px 11px;border-radius:999px;font-size:11px;font-weight:700;background:rgba(250,204,21,.14);border:1px solid rgba(250,204,21,.5);color:#fde68a;position:relative}' +
         '.cz-mil-badge.off{background:rgba(239,68,68,.16);border-color:rgba(239,68,68,.5);color:#fca5a5}' +
         '.cz-mil-stripes{display:flex;flex-direction:column;gap:3px;position:relative}.cz-mil-stripes i{display:block;width:34px;height:5px;border-radius:2px;background:linear-gradient(90deg,#facc15,#d97706)}' +
-        '.cz-mil-void{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(2,6,15,.55);font-size:34px;font-weight:800;color:#f87171;transform:rotate(-12deg);letter-spacing:4px;z-index:2}' +
+        '.cz-mil-void{pointer-events:none;position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(2,6,15,.55);font-size:34px;font-weight:800;color:#f87171;transform:rotate(-12deg);letter-spacing:4px;z-index:2}' +
         '.cz-mil-next{font-size:12px;color:#94a3b8;text-align:center;margin:0 0 10px;line-height:1.8}.cz-mil-next b{color:#fde68a}' +
         '.cz-bcwrap{display:block;margin-top:12px;background:#fff;border-radius:8px;padding:7px 10px 4px;text-decoration:none;position:relative}' +
         '.cz-bcwrap svg{display:block;width:100%;height:48px}' +
         '.cz-bcwrap small{display:block;text-align:center;color:#0f172a;font:700 11px/1.4 Consolas,monospace;letter-spacing:5px;margin-top:2px}' +
         '.cz-bcwrap em{display:block;text-align:center;color:#64748b;font-style:normal;font-size:10px;letter-spacing:0}' +
+        '.cz-mil-s{max-width:380px;margin-left:auto;margin-right:auto}' +
+        '.cz-mil-s .cz-mil{padding:12px 14px;border-radius:16px}' +
+        '.cz-mil-s .cz-id-title{font-size:16px}.cz-mil-s .cz-id-sub{font-size:9px;letter-spacing:1.5px}' +
+        '.cz-mil-s .cz-id-body{margin-top:10px;gap:10px}' +
+        '.cz-mil-s .cz-avatar{width:58px;height:72px;font-size:26px;border-radius:10px}' +
+        '.cz-mil-s .cz-f{font-size:12px;padding:2px 0}' +
+        '.cz-mil-s .cz-id-foot{margin-top:8px}.cz-mil-s .cz-num{font-size:20px;letter-spacing:4px}' +
+        '.cz-mil-s .cz-chip{width:30px;height:22px}.cz-mil-s .cz-mil-stripes i{width:26px;height:4px}' +
+        '.cz-mil-s .cz-bcwrap{margin-top:8px;padding:5px 8px 3px;cursor:pointer}.cz-mil-s .cz-bcwrap svg{height:34px}.cz-mil-s .cz-bcwrap small{font-size:10px;letter-spacing:4px}' +
+        '.cz-mil-s .cz-mil-badge{font-size:10px;padding:3px 9px}.cz-mil-s .cz-mil-void{font-size:26px}' +
+        '.cz-zoom{position:fixed;inset:0;z-index:99995;background:rgba(2,6,15,.86);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:16px;cursor:pointer;animation:czzin .18s ease}' +
+        '@keyframes czzin{from{opacity:0}to{opacity:1}}' +
+        '.cz-zoom .cz-mil-wrap{width:100%;max-width:640px}' +
+        '.cz-zoom .cz-mil{padding:26px 28px;border-radius:26px;margin:0;cursor:pointer;box-shadow:0 30px 80px rgba(0,0,0,.75),0 0 0 1px rgba(250,204,21,.35)}' +
+        '.cz-zoom .cz-id-title{font-size:28px}.cz-zoom .cz-id-sub{font-size:12px}' +
+        '.cz-zoom .cz-id-body{margin-top:20px;gap:20px}' +
+        '.cz-zoom .cz-avatar{width:112px;height:136px;font-size:52px;border-radius:16px}' +
+        '.cz-zoom .cz-f{font-size:18px;padding:6px 0}' +
+        '.cz-zoom .cz-id-foot{margin-top:18px}.cz-zoom .cz-num{font-size:34px;letter-spacing:7px}' +
+        '.cz-zoom .cz-chip{width:52px;height:38px}.cz-zoom .cz-mil-stripes i{width:46px;height:7px}' +
+        '.cz-zoom .cz-bcwrap{margin-top:18px;padding:10px 14px 6px;border-radius:10px}.cz-zoom .cz-bcwrap svg{height:84px}.cz-zoom .cz-bcwrap small{font-size:14px}' +
+        '.cz-zoom .cz-mil-badge{font-size:14px;padding:6px 14px}.cz-zoom .cz-mil-void{font-size:64px}' +
+        '.cz-zoom-hint{margin-top:14px;color:#94a3b8;font-size:12px}' +
+        '@media (max-width:480px){.cz-zoom .cz-mil{padding:16px 16px;border-radius:20px}.cz-zoom .cz-id-title{font-size:21px}.cz-zoom .cz-avatar{width:84px;height:102px;font-size:38px}.cz-zoom .cz-f{font-size:15px;padding:4px 0}.cz-zoom .cz-num{font-size:25px;letter-spacing:5px}.cz-zoom .cz-bcwrap svg{height:64px}.cz-zoom .cz-mil-void{font-size:42px}}' +
         '.cc-sel{cursor:pointer}.cc-sel.on{border-color:#facc15!important;box-shadow:0 0 0 1px #facc15}' +
         '.cc-panel{border:1px solid rgba(250,204,21,.45);border-radius:16px;padding:14px;margin-bottom:12px;background:rgba(250,204,21,.05)}' +
         '.cc-btns{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:10px}.cc-btns .btn{width:100%;margin:0;text-align:center;text-decoration:none;display:block}';
@@ -16857,7 +16291,10 @@ function czBarcode(text) {
     x += 12;
     return '<svg viewBox="0 0 ' + x + ' 50" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg" fill="#0f172a" shape-rendering="crispEdges">' + rects + '</svg>';
 }
-function czBcStrip(prefix, num, url) {
+function czBcStrip(prefix, num, url, mode) {
+    if (mode === 'zoom') return '<div class="cz-bcwrap" onclick="event.stopPropagation();czMilZoom()">' + czBarcode(prefix + num) + '<small>' + czEsc(num) + '</small></div>';
+    if (mode === 'plain') return '<div class="cz-bcwrap">' + czBarcode(prefix + num) + '<small>' + czEsc(num) + '</small></div>';
+    if (mode === 'link') return '<a class="cz-bcwrap" href="' + czEsc(url) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()">' + czBarcode(prefix + num) + '<small>' + czEsc(num) + '</small></a>';
     return '<a class="cz-bcwrap" href="' + czEsc(url) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()">' + czBarcode(prefix + num) + '<small>' + czEsc(num) + '</small><em>اضغط على الباركود لعرض حالة البطاقة</em></a>';
 }
 function czMilCard(p, o) {
@@ -16866,8 +16303,10 @@ function czMilCard(p, o) {
     var off = !!(p.isBlocked || f.revoked);
     var av = f.avatar ? '<img src="' + czEsc(f.avatar) + '" alt="" onerror="this.remove()">' : '';
     var stripes = '<i></i><i></i><i></i>';
-    return '<div id="' + (o.id || 'home-card') + '">' +
-        '<div class="cz-mil"' + (o.preview ? '' : ' onclick="renderCard()"') + '>' +
+    var bcMode = o.big ? 'plain' : (o.preview ? 'link' : 'zoom');
+    if (!o.preview && !o.big) window.CZ_MIL_P = p;
+    return '<div id="' + (o.id || 'home-card') + '" class="cz-mil-wrap' + ((o.preview || o.big) ? '' : ' cz-mil-s') + '">' +
+        '<div class="cz-mil"' + ((o.preview || o.big) ? '' : ' onclick="czMilZoom()"') + '>' +
         (f.revoked ? '<div class="cz-mil-void">ملغاة</div>' : '') +
         '<div class="cz-id-top"><div class="cz-logo">' + CZ_BOLT + '</div><div><div class="cz-id-title">البطاقة العسكرية</div><div class="cz-id-sub">FLASH CITY • MILITARY ID</div></div>' +
         '<div class="cz-mil-badge' + (off ? ' off' : '') + '">' + (off ? '🚫 موقوفة' : '🪖 فعّال') + '</div></div>' +
@@ -16878,11 +16317,23 @@ function czMilCard(p, o) {
         '</div></div>' +
         '<div class="cz-id-foot"><div><div style="font-size:11px;color:#bbf7d0">رقم البطاقة</div><div class="cz-num" data-k="num">' + czEsc(f.num) + '</div></div>' +
         '<div style="display:flex;align-items:center;gap:12px"><div class="cz-mil-stripes">' + stripes + '</div><div class="cz-chip"></div></div></div>' +
-        (/^[0-9]{8}$/.test(String(f.num)) ? czBcStrip('FLASH-M-', f.num, '/verify-card/' + f.num) : '') +
+        (/^[0-9]{8}$/.test(String(f.num)) ? czBcStrip('FLASH-M-', f.num, '/verify-card/' + f.num, bcMode) : '') +
         '</div>' +
-        (o.preview ? '' : '<div class="cz-mil-next"><span id="home-next">' + czEsc(p.nextRank ? (f.rank + ' ——> ' + p.nextRank) : 'أعلى رتبة') + '</span><br><b id="home-remaining">' + czEsc(remainText(o.nextRank, o.remaining)) + '</b></div>') +
+        ((o.preview || o.big) ? '' : '<div class="cz-mil-next"><span id="home-next">' + czEsc(p.nextRank ? (f.rank + ' ——> ' + p.nextRank) : 'أعلى رتبة') + '</span><br><b id="home-remaining">' + czEsc(remainText(o.nextRank, o.remaining)) + '</b></div>') +
         '</div>';
 }
+function czMilZoom() {
+    var p = window.CZ_MIL_P || (typeof ME !== 'undefined' ? ME : null);
+    if (!p) return;
+    czMilZoomClose();
+    var z = document.createElement('div');
+    z.className = 'cz-zoom'; z.id = 'cz-zoom';
+    z.onclick = czMilZoomClose;
+    z.innerHTML = czMilCard(p, { id: 'cz-zoom-card', big: true }) + '<div class="cz-zoom-hint">اضغط بأي مكان للإغلاق</div>';
+    document.body.appendChild(z);
+}
+function czMilZoomClose() { var z = document.getElementById('cz-zoom'); if (z) z.remove(); }
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') czMilZoomClose(); });
 function czLicCard(c) {
     var vs = (c.vehicles || []).map(function (v) { return '<span class="cz-veh">🚗 ' + czEsc(v.name) + '</span>'; }).join('');
     return '<div class="cz-lic">' +
@@ -17276,7 +16727,6 @@ function buildNav() {
     items.push(
         { label: '📋 مخالفاتي', fn: 'renderMinePage()' },
         { label: '🌴 الإجازات', fn: 'renderLeavePage()' },
-        { label: '🩺 غياب بعذر', fn: 'renderExcusePage()' },
         { label: '🪪 بطاقتي', fn: 'renderCard()' },
         { label: '📜 الشهادات', fn: 'renderCertPage()' },
     );
@@ -17483,7 +16933,6 @@ async function pollTick() {
         }
         lastKnownRank = fresh.rank;
         ME = fresh; odFix();
-        try { flRcRefresh(); } catch (x) {}
         if (fresh.deviceLocked && !fresh.cyberLocked) { dvHardLock(); return; }
         if (fresh.unassigned && !fresh.cyberLocked) { uaHardLock(); return; }
         buildNav();
@@ -17800,7 +17249,7 @@ function renderDashboard() {
         <div class="cz-wrap">
         <div class="cz-hd">
             <div><div class="cz-hd-name">\${ME.registeredName}</div><div class="cz-hd-sub">\${ME.unit} • \${ME.rank}</div></div>
-            <a class="btn gray sm" href="/auth/logout">🚪 خروج</a>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;"><button class="btn sm btn-checkout" onclick="flBankOpen()">🏦 بنك فلاش</button><a class="btn gray sm" href="/auth/logout">🚪 خروج</a></div>
         </div>
         \${flAttCardHtml()}<div id="push-banner"></div><div id="court-soon">\${courtSoonHtml()}</div>
         \${ME.maintenance ? '<div class="card" style="border-color:var(--amber);color:#fbbf24;">⚠️ الموقع في وضع الصيانة حالياً</div>' : ''}
@@ -17816,7 +17265,6 @@ function renderDashboard() {
             \${!ME.violationsDisabled ? (ME.isAntiDrugs && !ME.isSeniorAdmin
                 ? '<button class="btn" onclick="renderNewReport()">📝 تسجيل تقرير</button>'
                 : '<button class="btn" onclick="renderNewViolation()">🚨 تسجيل مخالفة</button>') : ''}
-            <button class="btn gray" onclick="flBankOpen()">🏦 بنك فلاش</button>
             \${ME.isAdmin ? '<button class="btn gray" onclick="renderAdmin()">🛠️ لوحة الإدارة</button>' : ''}
             \${(ME.sectorInfo && ME.sectorInfo.sector !== 'cyber') ? \`<button class="btn gray" onclick="renderSectorPanel()">🪖 قيادة \${ME.sectorInfo.sectorLabel}</button>\` : ''}
             \${/* ملاحظة: هنا التردد — تم حذف الزر فقط والكود باقي. لإرجاع الزر استبدل '' بـ flFreqBtnHtml() */ ''}
@@ -18139,7 +17587,6 @@ function renderAdmin(startTab) {
             <div class="tab" onclick="adminTab('sectors', this)">قادة القطاعات</div>
             <div class="tab" onclick="adminTab('att', this)">🖐️ لوحة البصمة</div>
             <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
-            <div class="tab" id="tab-excuses" onclick="adminTab('excuses', this)">🩺 غياب بعذر</div>
             <div class="tab" id="tab-court" onclick="adminTab('court', this)">⚖️ المحكمة العسكرية</div>
             <div class="tab" id="tab-inv" onclick="adminTab('inv', this)">🔎 التحقيق العسكري</div>
             \${/* ملاحظة: هنا سلك الضباط (إدارة السلك) — النظام موجود بالكود وتم حذف التاب فقط. لإرجاعه شغّل OFFICERS_CORPS_ENABLED */ ''}
@@ -18190,7 +17637,6 @@ function adminTab(name, el) {
     if (name === 'hire') loadHire();
     if (name === 'thresholds') loadThresholds();
     if (name === 'leave') loadSeniorLeavePage();
-    if (name === 'excuses') loadSeniorExcuses();
     if (name === 'att') attOpen();
     if (name === 'sfile') sfOpen();
     if (name === 'log') loadLog();
@@ -18236,7 +17682,7 @@ function attBar(pct, color) {
 function attOpen() {
     var box = document.getElementById('admin-content');
     if (!box) return;
-    var T = [['members', '👥 الأعضاء'], ['hours', '⏱️ ساعات الدوام'], ['absent', '🚫 المتغيبون'], ['sectors', '📈 القطاعات'], ['viol', '🚨 تجاوزات الحضور'], ['cfg', '⚙️ الإعدادات']];
+    var T = [['members', '👥 الأعضاء'], ['hours', '⏱️ ساعات الدوام'], ['sectors', '📈 القطاعات'], ['viol', '🚨 تجاوزات الحضور'], ['cfg', '⚙️ الإعدادات']];
     box.innerHTML = '<div class="tabs" id="att-tabs">' + T.map(function (t) {
         return '<div class="tab' + (t[0] === ATTP.tab ? ' active' : '') + '" data-t="' + t[0] + '" onclick="attSetTab(this.dataset.t)">' + t[1] + '</div>';
     }).join('') + '</div><div id="att-body"></div>';
@@ -18263,7 +17709,6 @@ async function attLoad(silent) {
     var tab = ATTP.tab, url;
     if (tab === 'members') url = '/api/senior/att/members';
     else if (tab === 'hours') url = '/api/senior/att/hours?period=' + ATTP.period;
-    else if (tab === 'absent') url = '/api/senior/att/absent?days=' + ATTP.days;
     else if (tab === 'viol') url = '/api/hc/att-violations?filter=' + ATTV.filter;
     else if (tab === 'cfg') url = '/api/senior/att/config';
     else url = '/api/senior/att/sectors';
@@ -18284,7 +17729,6 @@ async function attLoad(silent) {
     ATTP.sig = sig;
     if (tab === 'members') attPaintMembers(d);
     else if (tab === 'hours') attPaintHours(d);
-    else if (tab === 'absent') attPaintAbsent(d);
     else if (tab === 'viol') attPaintViol(d);
     else if (tab === 'cfg') attPaintCfg(d);
     else attPaintSectors(d);
@@ -18380,7 +17824,6 @@ async function attForce(uid, type) {
     } catch (e) { toast(e.message); }
 }
 function attSetPeriod(v) { ATTP.period = v; attLoad(false); }
-function attSetDays(v) { ATTP.days = parseInt(v, 10) || 3; attLoad(false); }
 function attPaintHours(d) {
     var body = document.getElementById('att-body');
     if (!body) return;
@@ -18398,32 +17841,6 @@ function attPaintHours(d) {
     body.innerHTML = '<div class="card"><div class="row" style="justify-content:flex-start;">' + chips + '</div>' +
         '<div style="font-size:12px;color:var(--muted);margin-top:10px;">إجمالي ساعات الدوام: <b style="color:var(--gold-soft);">' + attFmtMs(d.totalMs) + '</b> • عدد اللي داوموا: ' + d.count + '</div></div>' +
         rows + '<div style="font-size:11px;color:var(--muted);text-align:center;margin-bottom:14px;">كل جلسة تُحسب بحد أقصى ١٢ ساعة، عشان اللي ينسى الانصراف ما يتضخم رقمه.</div>';
-}
-function attPaintAbsent(d) {
-    var body = document.getElementById('att-body');
-    if (!body) return;
-    if (d.reception) { attPaintReception(d); return; }
-    var P = [[1, 'اليوم'], [3, 'آخر ٣ أيام'], [7, 'آخر ٧ أيام'], [14, 'آخر ١٤ يوم']];
-    var chips = P.map(function (p) { return attChip(p[1], ATTP.days === p[0], 'attSetDays', p[0]); }).join('');
-    var pct = d.total ? Math.round(d.absentCount / d.total * 100) : 0;
-    var rows = d.list.length ? d.list.map(function (x) {
-        return '<div class="card" style="padding:12px;"><div class="row"><div><b>' + cyEsc(x.name) + '</b>' + (x.onLeave ? ' <span class="badge approved">🌴 في إجازة</span>' : '') +
-            '<div style="font-size:12px;color:var(--muted);margin-top:3px;">' + attMeta(x) + '</div></div>' +
-            '<div style="text-align:left;font-size:12px;color:' + (x.lastCheckInAt ? 'var(--muted)' : '#f87171') + ';">' + (x.lastCheckInAt ? 'آخر حضور<br>' + attFmtT(x.lastCheckInAt) + '<br>' + attAgo(x.lastCheckInAt) : 'ما حضر أبداً') + '</div></div></div>';
-    }).join('') : '<div class="card center" style="color:#4ade80;">🎉 الكل حاضر في هذي الفترة</div>';
-    body.innerHTML = '<div class="card"><div class="row" style="justify-content:flex-start;">' + chips + '</div>' +
-        '<div class="row" style="margin-top:12px;"><div><b style="font-size:18px;color:#f87171;">' + d.absentCount + '</b> <span style="color:var(--muted);font-size:13px;">من ' + d.total + ' ما حضروا (' + pct + '%)</span></div>' +
-        '<button class="btn sm gray" onclick="attCopyAbsent()">📋 نسخ الأسماء</button></div>' + attBar(pct, 'linear-gradient(90deg,#ef4444,#f87171)') +
-        '<div style="font-size:11px;color:var(--muted);margin-top:8px;">النسخ يستثني اللي في إجازة، وكبار المسؤولين ما يدخلون بالحساب.</div></div>' + rows;
-}
-function attCopyAbsent() {
-    var d = ATTP.data.absent;
-    if (!d) return;
-    var nl = String.fromCharCode(10);
-    var t = d.list.filter(function (x) { return !x.onLeave; }).map(function (x) { return x.name; }).join(nl);
-    if (!t) { toast('ما فيه أسماء للنسخ'); return; }
-    try { navigator.clipboard.writeText(t).then(function () { toast('تم نسخ الأسماء'); }, function () { toast('تعذر النسخ'); }); }
-    catch (e) { toast('تعذر النسخ'); }
 }
 function attPaintSectors(d) {
     var body = document.getElementById('att-body');
@@ -18873,7 +18290,6 @@ function renderSectorsBox() {
             <div id="hc-members-list" style="margin-top:10px;">جارِ التحميل...</div>
         </div>\`;
     loadHighCommandList();
-    flReceptionMount();
     flHideCyberPO();
 }
 async function loadHighCommandList() {
@@ -19029,7 +18445,6 @@ function renderHighCommandPanel() {
             <div class="tab active" onclick="hcTabSwitch('pending', this)">⏳ الطلبات المعلّقة</div>
             <div class="tab" onclick="hcTabSwitch('history', this)">📜 السجل</div>
             <div class="tab" onclick="hcTabSwitch('att', this)">🚨 تجاوزات الحضور</div>
-            <div class="tab" onclick="hcTabSwitch('exc', this)">🩺 أعذار الغياب</div>
         </div>
         <div id="hc-content"></div>\`;
     hcTabSwitch('pending');
@@ -19041,7 +18456,6 @@ function hcTabSwitch(name, el) {
     if (name === 'pending') loadHCPending();
     if (name === 'history') loadHCHistory();
     if (name === 'att') loadHCAtt();
-    if (name === 'exc') loadHCExcuses();
 }
 function hcCard(r, withActions) {
     const kind = r.kind || 'rank';
@@ -19098,317 +18512,6 @@ function exCompress(file, maxDim, qual) {
         fr.readAsDataURL(file);
     });
 }
-function exBadge(st) {
-    if (st === 'pending') return '<span class="badge pending">⏳ بانتظار القيادة العليا</span>';
-    if (st === 'accepted') return '<span class="badge approved">✅ مقبول</span>';
-    if (st === 'rejected') return '<span class="badge rejected">❌ مرفوض</span>';
-    return '';
-}
-function exTypeLabel(t) { return t === 'medical' ? '🩺 طبي' : '📄 بدون طبي'; }
-async function renderExcusePage() {
-    document.getElementById('app').innerHTML = '<div class="card row"><h2>🩺 غياب بعذر</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع</button></div>' +
-        '<div id="ex-body"><div class="card">جارِ التحميل...</div></div>';
-    exLoad();
-}
-async function exLoad() {
-    var box = document.getElementById('ex-body');
-    if (!box) return;
-    var d;
-    try { d = await api('/api/excuse/my'); }
-    catch (e) { box.innerHTML = '<div class="card" style="color:#f87171;">' + cyEsc(e.message) + '</div>'; return; }
-    if (!d.list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">ما عليك أي غياب عن الاستلام في آخر ١٤ يوم 👌</div>'; return; }
-    box.innerHTML = '<div class="card" style="font-size:12px;color:var(--muted);">اختر الغياب وقدّم عذرك. إذا انقبل العذر ترجع لك النقاط، وإذا انرفض يتثبت الخصم.</div>' + d.list.map(function (x) {
-        var ex = x.excuse;
-        var right = '';
-        if (x.excuseStatus === 'none') right = '<button class="btn sm" data-id="' + x.rowId + '" onclick="exOpen(this.dataset.id)">تقديم عذر</button>';
-        else if (x.excuseStatus === 'removed') right = '<span class="badge approved">🧹 أُزيل الغياب</span>';
-        else if (ex) right = exBadge(ex.status);
-        var info = '';
-        if (ex) {
-            info = '<div style="font-size:13px;margin-top:8px;">' + exTypeLabel(ex.type) + ' — ' + cyEsc(ex.reason) + (ex.hasProof ? ' 📎' : '') + '</div>' +
-                '<div style="font-size:11px;color:var(--muted);margin-top:4px;">قدّمته: ' + exFull(ex.createdAt) + '</div>';
-            if (ex.status === 'rejected' && ex.rejectReason) info += '<div style="font-size:12px;color:#f87171;margin-top:4px;">سبب الرفض: ' + cyEsc(ex.rejectReason) + '</div>';
-            if (ex.status === 'accepted') info += '<div style="font-size:12px;color:#4ade80;margin-top:4px;">انسجّل في ملفك وبطاقتك كغياب بعذر' + (x.refunded ? ' ورجعت لك ' + x.refunded + ' نقطة' : '') + '</div>';
-        }
-        var ded = (x.excuseStatus === 'accepted' || x.excuseStatus === 'removed') ? '' : (x.deducted ? ' • انخصم عليك ' + x.deducted + ' نقطة' : ' • بدون خصم');
-        return '<div class="card" style="padding:12px;"><div class="row"><div><b>غياب عن الاستلام</b><div style="font-size:12px;color:var(--muted);margin-top:3px;">' + exFull(x.openedAt) + ded + '</div></div><div>' + right + '</div></div>' + info +
-            '<div id="ex-f-' + x.rowId + '"></div></div>';
-    }).join('');
-}
-function exOathText(id) {
-    var r = document.getElementById('ex-r-' + id);
-    var reason = r && r.value.trim() ? r.value.trim() : '(سبب الغياب)';
-    var nm = (ME && (ME.registeredName || ME.name)) || '(الاسم)';
-    return 'أُقسم بالله العظيم، أنا (' + nm + ')، بأن العذر الذي تقدمت به بشأن غيابي وهو (' + reason + ') صحيح، وأتحمل كامل المسؤولية عن صحة ما ذكرته، وأتعهد بعدم تقديم أي عذر غير صحيح، والله على ما أقول شهيد.';
-}
-function exOathRefresh(id) { var el = document.getElementById('ex-oath-' + id); if (el) el.textContent = exOathText(id); }
-function exOpen(id) {
-    var box = document.getElementById('ex-f-' + id);
-    if (!box) return;
-    if (box.innerHTML) { exVoiceReset(); box.innerHTML = ''; return; }
-    exVoiceReset();
-    box.innerHTML = '<div style="margin-top:10px;display:flex;flex-direction:column;gap:8px;">' +
-        '<textarea id="ex-r-' + id + '" rows="3" maxlength="500" placeholder="اكتب عذرك هنا..." style="width:100%;" oninput="exOathRefresh(this.id.slice(5))"></textarea>' +
-        '<select id="ex-t-' + id + '"><option value="medical">🩺 طبي</option><option value="nonmedical">📄 بدون طبي</option></select>' +
-        '<div style="font-size:12px;color:#fbbf24;">دليل (إجباري) — صورة:</div>' +
-        '<input type="file" id="ex-p-' + id + '" accept="image/*">' +
-        '<div style="font-size:13px;color:var(--gold-soft);margin-top:4px;">📜 القسم (إجباري — لازم تقوله بصوتك):</div>' +
-        '<div id="ex-oath-' + id + '" style="padding:10px;border:1px solid var(--border);border-radius:8px;font-size:14px;line-height:1.9;">' + accEsc(exOathText(id)) + '</div>' +
-        '<div id="ex-v-' + id + '"></div>' +
-        '<div class="row" style="gap:8px;justify-content:flex-start;"><button class="btn sm" data-id="' + id + '" onclick="exSend(this.dataset.id)">إرسال</button>' +
-        '<button class="btn gray sm" data-id="' + id + '" onclick="exOpen(this.dataset.id)">إلغاء</button></div></div>';
-    exVoicePaint(id);
-}
-// ---- تسجيل القسم الصوتي ----
-var EXV = { rec: null, stream: null, chunks: [], mime: '', t0: 0, timer: null, blob: null, dur: 0, id: null };
-function exVoiceReset() {
-    try { if (EXV.rec && EXV.rec.state !== 'inactive') { EXV.rec.onstop = null; EXV.rec.stop(); } } catch (e) {}
-    try { if (EXV.stream) EXV.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
-    if (EXV.timer) clearInterval(EXV.timer);
-    EXV = { rec: null, stream: null, chunks: [], mime: '', t0: 0, timer: null, blob: null, dur: 0, id: null };
-}
-function exVoicePaint(id) {
-    var box = document.getElementById('ex-v-' + id);
-    if (!box) return;
-    if (EXV.rec) {
-        box.innerHTML = '<div class="row" style="gap:10px;justify-content:flex-start;"><span class="sp-rec-dot"></span><b id="ex-vt-' + id + '">0:00</b>' +
-            '<button class="btn danger sm" data-id="' + id + '" onclick="exVoiceStop(this.dataset.id)">⏹️ إيقاف</button></div>';
-    } else if (EXV.blob) {
-        box.innerHTML = '<audio controls style="width:100%;" src="' + URL.createObjectURL(EXV.blob) + '"></audio>' +
-            '<div class="row" style="gap:8px;justify-content:flex-start;margin-top:6px;"><span style="color:#4ade80;font-size:13px;">✅ تم تسجيل القسم (' + EXV.dur + ' ث)</span>' +
-            '<button class="btn gray sm" data-id="' + id + '" onclick="exVoiceAgain(this.dataset.id)">🔁 إعادة التسجيل</button></div>';
-    } else {
-        box.innerHTML = '<button class="btn sm" data-id="' + id + '" onclick="exVoiceStart(this.dataset.id)">🎙️ سجّل القسم بصوتك</button>';
-    }
-}
-function exVoiceAgain(id) { exVoiceReset(); exVoicePaint(id); }
-async function exVoiceStart(id) {
-    if (!spVoiceSupported()) return toast('متصفحك ما يدعم تسجيل الصوت');
-    var stream;
-    try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
-    catch (e) { return toast('اسمح للمايك من إعدادات المتصفح عشان تسجل القسم'); }
-    var mime = spVoicePickMime(), rec;
-    try { rec = mime ? new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 32000 }) : new MediaRecorder(stream); }
-    catch (e) { stream.getTracks().forEach(function (t) { t.stop(); }); return toast('تعذر بدء التسجيل'); }
-    EXV.stream = stream; EXV.rec = rec; EXV.chunks = []; EXV.blob = null; EXV.id = id;
-    EXV.mime = String(rec.mimeType || mime || 'audio/webm').split(';')[0];
-    rec.ondataavailable = function (e) { if (e.data && e.data.size) EXV.chunks.push(e.data); };
-    rec.onstop = function () {
-        var dur = (Date.now() - EXV.t0) / 1000;
-        try { EXV.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
-        if (EXV.timer) { clearInterval(EXV.timer); EXV.timer = null; }
-        EXV.rec = null;
-        if (dur < 3 || !EXV.chunks.length) { EXV.chunks = []; toast('التسجيل قصير، اقرأ القسم كامل'); return exVoicePaint(id); }
-        var blob = new Blob(EXV.chunks, { type: EXV.mime });
-        EXV.chunks = [];
-        if (blob.size > 3.8 * 1024 * 1024) { toast('التسجيل كبير، قصّر'); return exVoicePaint(id); }
-        EXV.blob = blob; EXV.dur = Math.max(1, Math.round(dur));
-        exVoicePaint(id);
-    };
-    EXV.t0 = Date.now();
-    rec.start(250);
-    EXV.timer = setInterval(function () {
-        var el = document.getElementById('ex-vt-' + id);
-        if (el) el.textContent = spFmtDur((Date.now() - EXV.t0) / 1000);
-        if (Date.now() - EXV.t0 > 120000) exVoiceStop(id);
-    }, 200);
-    exVoicePaint(id);
-}
-function exVoiceStop(id) { try { if (EXV.rec && EXV.rec.state !== 'inactive') EXV.rec.stop(); } catch (e) {} }
-function exBlobToB64(blob) {
-    return new Promise(function (resolve, reject) {
-        var fr = new FileReader();
-        fr.onload = function () { resolve(String(fr.result).split(',')[1] || ''); };
-        fr.onerror = function () { reject(new Error('تعذر قراءة التسجيل')); };
-        fr.readAsDataURL(blob);
-    });
-}
-async function exSend(id) {
-    var r = document.getElementById('ex-r-' + id), t = document.getElementById('ex-t-' + id), p = document.getElementById('ex-p-' + id);
-    if (!r || !t) return;
-    var reason = r.value.trim();
-    if (reason.length < 3) return toast('اكتب العذر');
-    if (!p || !p.files || !p.files[0]) return toast('لازم ترفق دليل (صورة)');
-    if (!EXV.blob || EXV.id !== id) return toast('لازم تسجّل القسم بصوتك أول');
-    try {
-        var proof = await exCompress(p.files[0]);
-        var audio = await exBlobToB64(EXV.blob);
-        await api('/api/excuse/submit', { method: 'POST', body: JSON.stringify({ rowId: id, reason: reason, type: t.value, proof: proof, oath: true, audio: audio, audioMime: EXV.mime, audioDuration: EXV.dur }) });
-        exVoiceReset();
-        toast('✅ انرسل عذرك للقيادة');
-        exLoad();
-    } catch (e) { toast(e.message); }
-}
-function exOathBlock(x) {
-    if (!x.oathText && !x.hasAudio) return '';
-    return '<div style="margin-top:8px;padding:8px;border:1px solid var(--border);border-radius:8px;font-size:13px;line-height:1.8;">' +
-        '<div style="color:var(--gold-soft);">📜 القسم</div>' + (x.oathText ? accEsc(x.oathText) : '') +
-        (x.hasAudio ? '<audio controls preload="none" style="width:100%;margin-top:6px;" src="/api/hc/excuses/' + x._id + '/audio"></audio>' : '') + '</div>';
-}
-var HCEX = { f: 'pending' };
-function hcExSetFilter(f) { HCEX.f = f; loadHCExcuses(); }
-async function loadHCExcuses(silent) {
-    var box = document.getElementById('hc-content');
-    if (!box) return;
-    if (!silent) box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    var d;
-    try { d = await api('/api/hc/excuses?filter=' + HCEX.f); }
-    catch (e) { if (hcTab !== 'exc' || silent) return; box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل. (' + cyEsc(e.message) + ')</div>'; return; }
-    if (hcTab !== 'exc') return;
-    var chips = '<div class="card"><div class="row" style="justify-content:flex-start;">' +
-        attChip('⏳ المعلّقة' + (d.pendingCount ? ' (' + d.pendingCount + ')' : ''), HCEX.f === 'pending', 'hcExSetFilter', 'pending') +
-        attChip('📜 المنتهية', HCEX.f === 'done', 'hcExSetFilter', 'done') + '</div></div>';
-    var rows = d.list.length ? d.list.map(function (x) {
-        var meta = [x.unit, x.rank, x.sector].filter(Boolean).map(cyEsc).join(' • ') || '-';
-        var actions = '';
-        if (x.status === 'pending' || x.status === 'deciding') {
-            actions = '<div class="row" style="gap:8px;margin-top:10px;"><button class="btn sm" data-id="' + x._id + '" onclick="hcExDecide(this.dataset.id, ' + "'accept'" + ')">✅ قبول</button>' +
-                '<button class="btn danger sm" data-id="' + x._id + '" onclick="hcExDecide(this.dataset.id, ' + "'reject'" + ')">❌ رفض</button></div>';
-        } else {
-            actions = '<div style="margin-top:8px;">' + exBadge(x.status) + ' <span style="font-size:12px;color:var(--muted);">بواسطة ' + cyEsc(x.decidedByName || '-') + ' • ' + exFull(x.decidedAt) + '</span>' +
-                (x.status === 'accepted' && x.refunded ? '<div style="font-size:12px;color:#4ade80;margin-top:4px;">انسترجعت ' + x.refunded + ' نقطة</div>' : '') +
-                (x.status === 'rejected' && x.rejectReason ? '<div style="font-size:12px;color:#f87171;margin-top:4px;">سبب الرفض: ' + cyEsc(x.rejectReason) + '</div>' : '') + '</div>';
-        }
-        return '<div class="card"><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:2px;">' + meta + '</div>' +
-            '<div style="color:var(--gold-soft);margin-top:6px;">' + exTypeLabel(x.type) + ' — غياب ' + exFull(x.absenceAt) + '</div>' +
-            '<div style="font-size:13px;margin-top:6px;">العذر: ' + cyEsc(x.reason) + '</div>' +
-            (x.hasProof ? '<div style="margin-top:6px;"><button class="btn sm gray" data-id="' + x._id + '" onclick="hcExProof(this.dataset.id, this)">🖼️ عرض الدليل</button></div>' : '') + exOathBlock(x) +
-            '<div style="font-size:11px;color:var(--muted);margin-top:4px;">قُدّم: ' + exFull(x.createdAt) + '</div>' + actions + '</div>';
-    }).join('') : '<div class="card center" style="color:var(--muted);">' + (HCEX.f === 'pending' ? 'لا توجد أعذار معلّقة' : 'لا توجد أعذار منتهية') + '</div>';
-    paintSilent(box, 'hex' + HCEX.f, chips + rows, silent);
-}
-var SEX = { f: 'pending' };
-function sexSetFilter(f) { SEX.f = f; loadSeniorExcuses(); }
-async function loadSeniorExcuses(silent) {
-    var box = document.getElementById('admin-content');
-    if (!box || currentAdminTab !== 'excuses') return;
-    if (!silent) box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    var d;
-    try { d = await api('/api/hc/excuses?filter=' + SEX.f); }
-    catch (e) { if (currentAdminTab !== 'excuses' || silent) return; box.innerHTML = '<div class="card" style="color:#f87171;">تعذر التحميل. (' + cyEsc(e.message) + ')</div>'; return; }
-    if (currentAdminTab !== 'excuses') return;
-    var chips = '<div class="card"><div class="row" style="justify-content:flex-start;">' +
-        attChip('⏳ المعلّقة' + (d.pendingCount ? ' (' + d.pendingCount + ')' : ''), SEX.f === 'pending', 'sexSetFilter', 'pending') +
-        attChip('📜 المنتهية', SEX.f === 'done', 'sexSetFilter', 'done') + '</div></div>';
-    var rows = d.list.length ? d.list.map(function (x) {
-        var meta = [x.unit, x.rank, x.sector].filter(Boolean).map(cyEsc).join(' • ') || '-';
-        var actions = '';
-        if (x.status === 'pending' || x.status === 'deciding') {
-            actions = '<div class="row" style="gap:8px;margin-top:10px;"><button class="btn sm" data-id="' + x._id + '" data-a="accept" onclick="sexDecide(this.dataset.id, this.dataset.a)">✅ قبول</button>' +
-                '<button class="btn danger sm" data-id="' + x._id + '" data-a="reject" onclick="sexDecide(this.dataset.id, this.dataset.a)">❌ رفض</button></div>';
-        } else {
-            actions = '<div style="margin-top:8px;">' + exBadge(x.status) + ' <span style="font-size:12px;color:var(--muted);">بواسطة ' + cyEsc(x.decidedByName || '-') + '</span>' +
-                '<div style="font-size:12px;color:var(--muted);margin-top:4px;">🕒 وقت القرار: ' + exFull(x.decidedAt) + '</div>' +
-                (x.status === 'accepted' && x.refunded ? '<div style="font-size:12px;color:#4ade80;margin-top:4px;">انسترجعت ' + x.refunded + ' نقطة</div>' : '') +
-                (x.status === 'rejected' && x.rejectReason ? '<div style="font-size:12px;color:#f87171;margin-top:4px;">سبب الرفض: ' + cyEsc(x.rejectReason) + '</div>' : '') + '</div>';
-        }
-        return '<div class="card"><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:2px;">' + meta + '</div>' +
-            '<div style="color:var(--gold-soft);margin-top:6px;">' + exTypeLabel(x.type) + '</div>' +
-            '<div style="font-size:13px;margin-top:6px;">العذر: ' + cyEsc(x.reason) + '</div>' +
-            (x.hasProof ? '<div style="margin-top:6px;"><button class="btn sm gray" data-id="' + x._id + '" onclick="sexProof(this.dataset.id, this)">🖼️ عرض الدليل</button></div>' : '') + exOathBlock(x) +
-            '<div style="font-size:12px;margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08);line-height:1.9;">' +
-                '<div>📥 <b>وقت الاستلام:</b> ' + exFull(x.absenceAt) + '</div>' +
-                '<div>📝 <b>وقت تنفيذ الطلب:</b> ' + exFull(x.createdAt) + '</div>' +
-            '</div>' + actions + '</div>';
-    }).join('') : '<div class="card center" style="color:var(--muted);">' + (SEX.f === 'pending' ? 'لا توجد طلبات غياب بعذر معلّقة' : 'لا توجد طلبات منتهية') + '</div>';
-    paintSilent(box, 'sex' + SEX.f, chips + rows, silent);
-}
-function sexProof(id, btn) {
-    api('/api/hc/excuses/' + id + '/proof').then(function (d) {
-        var im = document.createElement('img');
-        im.src = d.image; im.style.cssText = 'max-width:100%;border-radius:8px;margin-top:6px;display:block;';
-        btn.parentNode.appendChild(im); btn.remove();
-    }).catch(function (e) { toast(e.message); });
-}
-async function sexDecide(id, action) {
-    if (action === 'reject') {
-        var reason = await promptModal('اكتب سبب رفض العذر:');
-        if (reason === null) return;
-        if (!reason.trim()) return toast('لازم تكتب سبب');
-        api('/api/hc/excuses/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason: reason }) })
-            .then(function () { toast('تم الرفض وتثبّت الخصم'); loadSeniorExcuses(); }).catch(function (e) { toast(e.message); });
-        return;
-    }
-    if (!(await confirmModal('تقبل العذر؟ بينحذف الخصم وترجع النقاط للعضو.'))) return;
-    api('/api/hc/excuses/' + id + '/accept', { method: 'POST', body: '{}' })
-        .then(function (r) { toast('✅ انقبل العذر' + (r.refunded ? ' ورجعت ' + r.refunded + ' نقطة' : '')); loadSeniorExcuses(); }).catch(function (e) { toast(e.message); });
-}
-function hcExProof(id, btn) {
-    api('/api/hc/excuses/' + id + '/proof').then(function (d) {
-        var im = document.createElement('img');
-        im.src = d.image; im.style.cssText = 'max-width:100%;border-radius:8px;margin-top:6px;display:block;';
-        btn.parentNode.appendChild(im); btn.remove();
-    }).catch(function (e) { toast(e.message); });
-}
-async function hcExDecide(id, action) {
-    if (action === 'reject') {
-        var reason = await promptModal('اكتب سبب رفض العذر:');
-        if (reason === null) return;
-        if (!reason.trim()) return toast('لازم تكتب سبب');
-        api('/api/hc/excuses/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason: reason }) })
-            .then(function () { toast('تم الرفض وتثبّت الخصم'); loadHCExcuses(); }).catch(function (e) { toast(e.message); });
-        return;
-    }
-    if (!(await confirmModal('تقبل العذر؟ بينحذف الخصم وترجع النقاط للعضو.'))) return;
-    api('/api/hc/excuses/' + id + '/accept', { method: 'POST', body: '{}' })
-        .then(function (r) { toast('✅ انقبل العذر' + (r.refunded ? ' ورجعت ' + r.refunded + ' نقطة' : '')); loadHCExcuses(); }).catch(function (e) { toast(e.message); });
-}
-function attExBadge(x) {
-    if (x.excuseStatus === 'removed') return ' <span class="badge approved">🧹 أُزيل الغياب</span>';
-    if (x.onLeave) return ' <span class="badge approved">🌴 في إجازة</span>';
-    if (x.excuseStatus === 'pending') return ' <span class="badge pending">⏳ عذر معلّق</span>';
-    if (x.excuseStatus === 'accepted') return ' <span class="badge approved">🩺 غياب بعذر</span>';
-    if (x.excuseStatus === 'rejected') return ' <span class="badge rejected">❌ عذر مرفوض</span>';
-    return '';
-}
-var ATTRM = { mode: 'all', ex: {}, list: [] }; // ex = الأشخاص اللي ينشال غيابهم (بوضع مستثنى)
-function attRmOpen() {
-    var d = ATTP.data.absent;
-    if (!ME || !ME.isOwner || !d || !d.reception) return;
-    var list = d.list.filter(function (x) { return !x.onLeave && x.excuseStatus !== 'accepted' && x.excuseStatus !== 'removed'; });
-    if (!list.length) { toast('ما فيه غايبين تنشال عنهم'); return; }
-    ATTRM = { mode: 'all', ex: {}, list: list };
-    document.getElementById('wf-overlay').classList.add('open');
-    attRmPaint();
-}
-function attRmMode(m) { ATTRM.mode = m; attRmPaint(); }
-function attRmTog(u) { ATTRM.ex[u] = !ATTRM.ex[u]; attRmPaint(); }
-function attRmPaint() {
-    var st = ATTRM, box = document.getElementById('wf-box');
-    if (!box) return;
-    var exN = 0;
-    st.list.forEach(function (x) { if (st.ex[x.uid]) exN++; });
-    var isEx = st.mode === 'except';
-    var n = isEx ? exN : st.list.length;
-    var rows = st.list.map(function (x) {
-        var ex = isEx && st.ex[x.uid]; // ex = انختار ينشال غيابه
-        var tog = isEx ? ' data-u="' + cyEsc(x.uid) + '" onclick="attRmTog(this.dataset.u)"' : '';
-        return '<div class="card" style="padding:8px 12px;margin-top:6px;' + (isEx ? 'cursor:pointer;' : '') + (isEx && !ex ? 'opacity:0.55;' : '') + '"' + tog + '><div class="row"><div><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:3px;">' + attMeta(x) + '</div></div>' +
-            '<span style="font-size:12px;">' + (isEx ? (ex ? '🧹 ينشال غيابه' : '🔒 يثبت غيابه') : '🧹 ينشال غيابه') + '</span></div></div>';
-    }).join('');
-    box.innerHTML = '<h3>🧹 إزالة الغياب (' + st.list.length + ' غايب)</h3>' +
-        '<div class="row" style="justify-content:flex-start;gap:6px;margin:8px 0;">' +
-            '<button class="btn sm ' + (isEx ? 'gray' : '') + '" data-m="all" onclick="attRmMode(this.dataset.m)">الكل</button>' +
-            '<button class="btn sm ' + (isEx ? '' : 'gray') + '" data-m="except" onclick="attRmMode(this.dataset.m)">مستثنى</button></div>' +
-        '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">' + (isEx ? 'الغياب يثبت على الجميع. اضغط على الشخص اللي تبي تستثنيه من الغياب (ينشال غيابه وترجع نقاطه).' : 'بينشال الغياب عن كل الغايبين وترجع نقاطهم، وينسجّل في ملفاتهم.') + '</div>' +
-        '<div style="max-height:45vh;overflow-y:auto;">' + rows + '</div>' +
-        '<div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button><button class="btn sm" onclick="attRmGo()">تأكيد الإزالة (' + n + ')</button></div>';
-}
-async function attRmGo() {
-    var st = ATTRM, d = ATTP.data.absent;
-    if (!d || !d.reception) return;
-    var exc = Object.keys(st.ex).filter(function (k) { return st.ex[k]; });
-    var isEx = st.mode === 'except';
-    var n = isEx ? exc.length : st.list.length;
-    if (n <= 0) { toast('اختر شخص واحد على الأقل ينشال غيابه'); return; }
-    if (!(await confirmModal('تبي تشيل الغياب عن ' + n + ' شخص؟ بترجع نقاطهم وينسجّل في ملفاتهم.'))) return;
-    try {
-        var r = await api('/api/owner/att/remove-absence', { method: 'POST', body: JSON.stringify({ dayKey: d.reception.dayKey, mode: st.mode, exceptUids: isEx ? exc : [] }) });
-        toast('🧹 انشال الغياب عن ' + r.removed + (r.refunded ? ' ورجعت ' + r.refunded + ' نقطة' : ''));
-        closeWarnForm();
-        attLoad(false);
-    } catch (e) { toast(e.message); }
-}
 var SF = { t: null, seq: 0 };
 function sfOpen() {
     var box = document.getElementById('admin-content');
@@ -19440,7 +18543,7 @@ function sfFull(t) {
     try { return new Date(t).toLocaleString('ar-SA-u-ca-gregory', { timeZone: 'Asia/Riyadh', year: 'numeric', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }); } catch (e) { return '—'; }
 }
 function sfExtra(d) {
-    var p = d.personnel, a = d.account, at = d.attendance, rs = d.receipts || [], st = d.receiptStats || {};
+    var p = d.personnel, a = d.account, at = d.attendance;
     var yn = function (b) { return b ? 'نعم' : 'لا'; };
     var out = '';
     // معلومات الحساب
@@ -19484,29 +18587,6 @@ function sfExtra(d) {
         sfRow('آخر تسجيل انصراف', sfFull(at.lastCheckOutAt))
     ) : sfRow('البصمة', '<span style="color:var(--muted);">ما سجّل حضور ولا مرة</span>');
     out += '<div class="id-card" style="margin-top:16px;"><div style="font-size:15px;font-weight:bold;color:var(--gold-soft);margin-bottom:8px;">🕒 البصمة</div><table>' + attRows + '</table></div>';
-    // الاستلامات
-    var kindLbl = function (r) {
-        if (r.kind === 'attended') return '<span style="color:#4ade80;">✅ حضر (+' + (r.gained || 1) + ')</span>';
-        if (r.kind === 'leave') return '<span style="color:#fbbf24;">🌴 إجازة</span>';
-        var ex = (r.excuseStatus === 'accepted' || r.removed || r.excuseStatus === 'removed') ? ' <span style="color:#4ade80;">(انشال الغياب' + (r.refunded ? ' • رجعت ' + r.refunded : '') + ')</span>'
-            : r.excuseStatus === 'pending' ? ' <span style="color:#fbbf24;">(عذر معلّق)</span>'
-            : r.excuseStatus === 'rejected' ? ' <span style="color:#f87171;">(عذر مرفوض)</span>' : '';
-        return '<span style="color:#f87171;">❌ غاب' + (r.deducted ? ' (-' + r.deducted + ')' : '') + '</span>' + ex;
-    };
-    var last = rs[0] || null;
-    var lastAtt = rs.filter(function (r) { return r.kind === 'attended'; })[0] || null;
-    var recHead = '<div style="font-size:15px;font-weight:bold;color:var(--gold-soft);margin-bottom:8px;">📣 الاستلامات (' + (st.total || 0) + ')</div>' +
-        '<table>' +
-        sfRow('آخر استلام', last ? sfFull(last.openedAt) + ' — ' + kindLbl(last) : '<span style="color:var(--muted);">ما له أي استلام</span>') +
-        sfRow('آخر استلام حضره', lastAtt ? sfFull(lastAtt.openedAt) : '—') +
-        sfRow('إجمالي الحضور', '<b style="color:#4ade80;">' + (st.attended || 0) + '</b>') +
-        sfRow('إجمالي الغياب', '<b style="color:#f87171;">' + (st.absent || 0) + '</b>') +
-        sfRow('إجمالي الإجازة', '<b>' + (st.leave || 0) + '</b>') +
-        '</table>';
-    var recList = rs.length ? '<div style="max-height:260px;overflow-y:auto;margin-top:10px;">' + rs.map(function (r) {
-        return '<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-top:6px;font-size:13px;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;"><span>' + sfFull(r.openedAt || r.dayKey) + '</span><span>' + kindLbl(r) + '</span></div>';
-    }).join('') + '</div>' : '';
-    out += '<div class="id-card" style="margin-top:16px;">' + recHead + recList + '</div>';
     return out;
 }
 async function sfView(discord) {
@@ -19527,35 +18607,6 @@ async function sfView(discord) {
             '<table><tr><td>اليونت</td><td>' + cardEsc(p.unit || '-') + '</td></tr><tr><td>الرتبة</td><td>' + cardEsc(p.rank) + '</td></tr></table>' + notes + '</div>' +
             sfExtra(d) + certFileBlock(d.certs || [], p.discord);
     } catch (e) { box.innerHTML = '<div class="card" style="color:#f87171;">' + cardEsc(e.message) + '</div>'; }
-}
-function attPaintReception(d) {
-    var body = document.getElementById('att-body');
-    if (!body) return;
-    var P = [[1, 'اليوم'], [3, 'آخر ٣ أيام'], [7, 'آخر ٧ أيام'], [14, 'آخر ١٤ يوم']];
-    var chips = P.map(function (p) { return attChip(p[1], ATTP.days === p[0], 'attSetDays', p[0]); }).join('');
-    var r = d.reception;
-    var rmN = d.list.filter(function (x) { return !x.onLeave && x.excuseStatus !== 'accepted' && x.excuseStatus !== 'removed'; }).length;
-    var canRm = !!(ME && ME.isOwner && r.dayKey && rmN);
-    var head = '<div class="card"><div class="row" style="justify-content:flex-start;">' + chips + '</div>' +
-        '<div style="font-size:12px;color:var(--muted);margin-top:10px;">📣 انفتح الاستلام: ' + attFmtT(r.openedAt) + ' • بواسطة ' + cyEsc(r.openedByName || '-') + '</div>' +
-        (r.closedAt ? '<div style=\"font-size:12px;color:var(--muted);margin-top:4px;\">🔒 انسكّر الاستلام: ' + attFmtT(r.closedAt) + ' • بواسطة ' + cyEsc(r.closedByName || '-') + '</div>' : '') +
-        '<div class="row" style="margin-top:10px;"><div><b style="color:#4ade80;">' + r.attendedCount + '</b> <span style="color:var(--muted);font-size:13px;">حضروا (+١)</span> • ' +
-        '<b style="color:#f87171;">' + r.absentCount + '</b> <span style="color:var(--muted);font-size:13px;">غابوا (-٢)</span> • ' +
-        '<b>' + r.leaveCount + '</b> <span style="color:var(--muted);font-size:13px;">إجازة</span></div>' +
-        '<div class="row" style="gap:6px;">' + (canRm ? '<button class="btn sm" onclick="attRmOpen()">🧹 إزالة الغياب</button>' : '') + '<button class="btn sm gray" onclick="attCopyAbsent()">📋 نسخ الغايبين</button></div></div></div>';
-    var okRows = d.attended.length ? d.attended.map(function (x) {
-        return '<div class="card" style="padding:12px;"><div class="row"><div><b>' + cyEsc(x.name) + '</b><div style="font-size:12px;color:var(--muted);margin-top:3px;">' + attMeta(x) + '</div></div>' +
-            '<div><span class="badge approved">✅ حضر +١</span></div></div></div>';
-    }).join('') : '<div class="card center" style="color:var(--muted);">ما فيه أحد كان حاضر وقت إغلاق الاستلام</div>';
-    var abRows = d.list.length ? d.list.map(function (x) {
-        var pts = x.onLeave ? '' : ((x.excuseStatus === 'accepted' || x.excuseStatus === 'removed') ? (x.refunded ? 'رجعت ' + x.refunded + ' نقطة' : '') : (x.deducted ? '-' + x.deducted + ' نقطة' : 'بدون خصم'));
-        return '<div class="card" style="padding:12px;"><div class="row"><div><b>' + cyEsc(x.name) + '</b>' + attExBadge(x) +
-            '<div style="font-size:12px;color:var(--muted);margin-top:3px;">' + attMeta(x) + '</div></div>' +
-            '<div style="text-align:left;font-size:12px;color:#f87171;">' + pts + '</div></div></div>';
-    }).join('') : '<div class="card center" style="color:#4ade80;">🎉 الكل حاضر</div>';
-    body.innerHTML = head +
-        '<h3 style="margin:14px 0 8px;color:#4ade80;">✅ حضروا (' + d.attended.length + ')</h3>' + okRows +
-        '<h3 style="margin:14px 0 8px;color:#f87171;">❌ ما حضروا (' + d.list.length + ')</h3>' + abRows;
 }
 function hcShowImage(id, btn) {
     api('/api/high-command/promotion-requests/' + id + '/image').then(function (d) {
@@ -21076,13 +20127,11 @@ function cardFields(p) {
         points: (p.points === undefined || p.points === null) ? '-' : String(p.points),
         note: p.notes === undefined ? '—' : (notes.length ? notes[notes.length - 1] : 'لا توجد ملاحظات'),
         notes: p.notes === undefined ? '—' : (notes.length ? notes.join(' | ') : 'لا توجد ملاحظات'),
-        excused: Array.isArray(p.excusedAbsences) ? (p.excusedAbsences.length ? p.excusedAbsences.slice().reverse().slice(0, 10).map(function (x) { return 'غياب بعذر — ' + exFull(x.absenceAt) + ' (اعتُمد ' + exFull(x.approvedAt) + ')'; }).join(' | ') : 'لا يوجد') : null,
-        removed: Array.isArray(p.removedAbsences) ? (p.removedAbsences.length ? p.removedAbsences.slice().reverse().slice(0, 10).map(function (x) { return 'غياب مُزال — ' + exFull(x.absenceAt) + ' (أُزيل ' + exFull(x.removedAt) + ')'; }).join(' | ') : 'لا يوجد') : null,
     };
 }
 const MC_DATA = {};
 const MC_OPT = {};
-const MC_ROWS = [['name', 'الاسم'], ['rank', 'الرتبة'], ['unit', 'اليونت'], ['num', 'رقم البطاقة'], ['points', 'النقاط'], ['sector', 'القطاع'], ['notes', 'الملاحظات'], ['excused', 'الغياب بعذر'], ['removed', 'الغياب المُزال']];
+const MC_ROWS = [['name', 'الاسم'], ['rank', 'الرتبة'], ['unit', 'اليونت'], ['num', 'رقم البطاقة'], ['points', 'النقاط'], ['sector', 'القطاع'], ['notes', 'الملاحظات']];
 // إحداثيات كل بطاقة (نسب مئوية من حجم البطاقة):
 // rows = مركز صفوف [الاسم، الرتبة، القطاع، رقم البطاقة] عمودياً | gx,gw = بداية وعرض خانات الكتابة
 // photo = [يسار، أعلى، عرض، ارتفاع] لمربع الصورة | bc = [يسار، أعلى، عرض، ارتفاع] لمنطقة الباركود
@@ -21508,7 +20557,6 @@ function mcInfoHtml(id) {
     const f = cardFields(p);
     let info = '';
     MC_ROWS.forEach(function (r) {
-        if ((r[0] === 'excused' || r[0] === 'removed') && f[r[0]] === null) return;
         info += '<div class="mc-row"><div class="mc-row-top"><span>' + r[1] + '</span><button class="mc-copy" onclick="mcCopy(this)">📋 نسخ</button></div><b data-k="' + r[0] + '">' + cardEsc(f[r[0]]) + '</b></div>';
     });
     if (id === 'me-card' || id === 'home-card') info += cpSectionHtml();
@@ -21865,15 +20913,7 @@ function attViewHtml(d) {
                 }).join('') : '<div style="color:var(--muted);margin-top:8px;">ما فيه أعضاء</div>') + '</div>';
         }).join('');
     }
-    var abs = d.absentToday || [];
-    h += '<div class="card"><h3>❌ غياب اليوم (' + abs.length + ')</h3>' +
-        (abs.length ? abs.map(function (r) {
-            var ex = r.excuseStatus === 'accepted' ? ' ✅ عذر مقبول' : r.excuseStatus === 'pending' ? ' ⏳ عذر قيد المراجعة' : r.excuseStatus === 'rejected' ? ' ❌ عذر مرفوض' : '';
-            return '<div class="row" style="padding:6px 0;border-top:1px solid var(--border);"><span>' + accEsc(r.name) +
-                ' <span style="color:var(--muted);font-size:12px;">(' + accEsc(r.rank || '-') + ' • ' + accEsc(r.unit || '-') + ')</span></span>' +
-                '<span style="color:var(--muted);font-size:12px;">' + accEsc(r.sector || '') + ex + '</span></div>';
-        }).join('') : '<div style="color:var(--muted);margin-top:8px;">لا يوجد غياب مسجّل اليوم</div>') + '</div>';
-    return h;
+    return h || '<div class="card center" style="color:var(--muted);">لا توجد بيانات تحضير لعرضها</div>';
 }
 async function loadAttInto(boxId) {
     var box = document.getElementById(boxId);
@@ -25111,49 +24151,12 @@ function flAttCardHtml() {
 }
 // ملاحظة: هنا التردد — زر التردد محذوف من الصفحة الرئيسية، والكود باقي ما انحذف
 function flFreqBtnHtml() { return '<button class="btn sm" onclick="flFreqOpen()">📻 تردد القطاعات المشتركة</button>'; }
-function flRcBtnHtml() {
-    if (!ME || !ME.isReceptionOfficer) return '';
-    if (!ME.isSeniorAdmin && !(ME.att && ME.att.status === 'in')) return '';
-    if (ME.receptionOpen) return '<button class=\"btn sm danger\" onclick=\"flReceptionClose()\">🔒 إغلاق الاستلام</button>';
-    return '<button class=\"btn sm\" onclick=\"flReceptionOpen()\">🎤 فتح استلام</button>';
-}
-function flRcRefresh() {
-    var w = document.getElementById('rc-btn-wrap');
-    if (!w) return;
-    var h = flRcBtnHtml();
-    if (w.innerHTML !== h) w.innerHTML = h;
-}
 function flAfterBtnsHtml() {
     var h = '';
     if (ME && ME.att && ME.att.status === 'in') {
         h += '<button class=\"btn sm btn-checkout\" onclick=\"renderFingerprint(\\'checkout\\')\">🚪 تسجيل انصراف</button>';
     }
-    if (ME && ME.isReceptionOfficer) h += '<span id=\"rc-btn-wrap\">' + flRcBtnHtml() + '</span>';
     return h;
-}
-async function flReceptionOpen() {
-    if (!(await confirmModal('تبي تفتح الاستلام وترسل إشعار للجميع؟ (الغيابات تنحسب لما تسكّر الاستلام)'))) return;
-    try {
-        var r = await api('/api/reception/open', { method: 'POST', body: '{}' });
-        ME.receptionOpen = r.receptionOpen || { openedAt: new Date().toISOString() };
-        flRcRefresh();
-        toast('📣 انفتح الاستلام — وصل لـ ' + r.sent + ' جهاز' + (r.discord ? ' + ديسكورد' : '') + ' — لا تنسى تسكّره');
-    } catch (e) {
-        if (e.message && /مفتوح|انسكّر|انفتح/.test(e.message)) { try { var f = await api('/api/me'); ME = f; } catch (x) {} flRcRefresh(); }
-        toast(e.message);
-    }
-}
-async function flReceptionClose() {
-    if (!(await confirmModal('تسكّر الاستلام؟ بيتم حساب الحضور والغياب الحين وخصم نقاط الغايبين.'))) return;
-    try {
-        var r = await api('/api/reception/close', { method: 'POST', body: '{}' });
-        ME.receptionOpen = null;
-        flRcRefresh();
-        toast('🔒 انسكّر الاستلام — حضروا ' + r.rec.attended + ' / غابوا ' + r.rec.absent + ' / إجازة ' + r.rec.leave);
-    } catch (e) {
-        if (e.message && /مو مفتوح|انسكّر/.test(e.message)) { try { var f = await api('/api/me'); ME = f; } catch (x) {} flRcRefresh(); }
-        toast(e.message);
-    }
 }
 
 /* ---------------- تردد القطاعات المشتركة ---------------- */
@@ -25959,53 +24962,6 @@ async function flFreqDel(n) {
     catch (e) { toast(e.message); }
 }
 
-/* ---------------- مسؤولو الاستلامات (داخل تاب قادة القطاعات) ---------------- */
-function flReceptionMount() {
-    var box = document.getElementById('admin-content');
-    if (!box || document.getElementById('rc-card')) return;
-    box.insertAdjacentHTML('beforeend', '<div class="card" id="rc-card"><h3>🎤 مسؤولو الاستلامات</h3>' +
-        '<div style="color:var(--muted);font-size:12px;margin-bottom:8px;">بعد ما يسجل المسؤول حضوره بالبصمة يظهر له زر «فتح استلام» (من 2 العصر إلى 9 الليل) — يوصل إشعار للجميع ورسالة بالديسكورد، وعند كل المسؤولين يتحول الزر إلى «إغلاق الاستلام»، ولما ينسكّر تنحسب الغيابات. تقدر تضيف أكثر من شخص.</div>' +
-        '<input placeholder="🔍 ابحث عن اسم الشخص المسجل بالموقع..." oninput="rcSearch(this.value)"><div id="rc-cand"></div><div id="rc-list" style="margin-top:10px;">جارِ التحميل...</div></div>');
-    rcLoad();
-}
-async function rcLoad() {
-    var box = document.getElementById('rc-list'); if (!box) return;
-    try {
-        var r = await api('/api/senior/reception');
-        if (!r.list.length) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا يوجد مسؤولي استلامات بعد</p>'; return; }
-        box.innerHTML = r.list.map(function (m) {
-            return '<div class="card" style="padding:8px 12px;margin-top:6px;"><div class="row"><span>' + spEsc(m.name) + '</span><button class="btn danger sm" data-u="' + m.id + '" onclick="rcRemove(this.dataset.u)">إزالة</button></div></div>';
-        }).join('');
-    } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
-}
-var rcTimer = null;
-function rcSearch(q) {
-    clearTimeout(rcTimer);
-    rcTimer = setTimeout(async function () {
-        var box = document.getElementById('rc-cand'); if (!box) return;
-        if (!q || !q.trim()) { box.innerHTML = ''; return; }
-        box.innerHTML = 'جارِ البحث...';
-        try {
-            var r = await api('/api/senior/personnel?q=' + encodeURIComponent(q), { noLock: true });
-            var list = (r.list || []).filter(function (p) { return p.registeredName; });
-            if (!list.length) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
-            box.innerHTML = list.slice(0, 15).map(function (p) {
-                return '<div class="card" style="padding:8px 12px;margin-top:6px;"><div class="row"><span>' + spEsc(p.registeredName) + ' <span style="color:var(--muted);font-size:12px;">(' + spEsc(p.unit || '-') + ' • ' + spEsc(p.rank || '') + ')</span></span>' +
-                    '<button class="btn sm" data-u="' + p.discord + '" onclick="rcAdd(this.dataset.u)">إضافة</button></div></div>';
-            }).join('');
-        } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
-    }, 350);
-}
-async function rcAdd(id) {
-    try { await api('/api/senior/reception/add', { method: 'POST', body: JSON.stringify({ discordId: id }) }); toast('تمت الإضافة'); var c = document.getElementById('rc-cand'); if (c) c.innerHTML = ''; rcLoad(); }
-    catch (e) { toast(e.message); }
-}
-async function rcRemove(id) {
-    if (!(await confirmModal('تزيله من مسؤولي الاستلامات؟'))) return;
-    try { await api('/api/senior/reception/remove', { method: 'POST', body: JSON.stringify({ discordId: id }) }); toast('تم'); rcLoad(); }
-    catch (e) { toast(e.message); }
-}
-
 /* ---------------- جهاز واحد بالحساب (آخر جهاز يفوز) ---------------- */
 function flSessionKicked() {
     FLX.kicked = true;
@@ -26036,7 +24992,7 @@ function flHideCyberPO() {
 
 /* حارس: المواطن ما يدخل صفحات العسكر أبداً */
 (function () {
-    ['renderDashboard', 'renderAdmin', 'renderCard', 'renderMinePage', 'renderLeavePage', 'renderExcusePage', 'renderCertPage',
+    ['renderDashboard', 'renderAdmin', 'renderCard', 'renderMinePage', 'renderLeavePage', 'renderCertPage',
      'renderNewViolation', 'renderNewReport', 'renderHighCommandPanel', 'renderCyberPanel', 'renderSectorPanel', 'renderMPPanel',
      'renderOfficerPage', 'renderTrainerPage'].forEach(function (n) {
         var f = window[n];
