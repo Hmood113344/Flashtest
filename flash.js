@@ -1765,21 +1765,6 @@ const app = express();
 });
 
 app.use(express.json({ limit: "8mb" }));
-// 🏦 أي أحد يفتح موقع فلاش (صفحة، مو API) → نصحّي البنك معه بالخلفية، بدون ما ننتظره ولا نبطّئ الصفحة
-var __bankWakeAt = 0;
-function bankWakeSoft() {
-    try {
-        var now = Date.now();
-        if (now - __bankWakeAt < 2 * 60 * 1000) return; // مرة كل دقيقتين كحد أقصى
-        __bankWakeAt = now;
-        var u = String(process.env.BANK_URL || "https://bank2-9d45.onrender.com").replace(/\/+$/, "");
-        fetch(u + "/healthz", { signal: AbortSignal.timeout(60000), headers: { "User-Agent": "flash-wake-bank" } }).catch(function () {});
-    } catch (e) {}
-}
-app.use(function (req, res, next) {
-    if (req.method === "GET" && !/^\/(api|bank|healthz|static|assets)\b/.test(req.path) && String(req.headers.accept || "").indexOf("text/html") !== -1) bankWakeSoft();
-    next();
-});
 // ================= تثبيت الموقع كتطبيق (إضافة للشاشة الرئيسية) =================
 const FLASH_ICONS = (function () {
     const zlib = require("zlib");
@@ -2814,29 +2799,6 @@ async function ensureJuniorInMySector(req, res, discordId) {
     if (!isJuniorRank(p.rank)) { res.status(403).json({ error: "صلاحيتك تشمل رتبة رئيس رقباء وتحت فقط" }); return null; }
     return p;
 }
-
-const nodePath = require("path");
-const fsCard = require("fs");
-// خلفيات البطاقات: لكل قطاع ملف صورة بجانب app.js باسم card-<المفتاح>.jpg
-// المفاتيح: patrol / roadSecurity / antiDrugs / mp / cyber / senior / highCommand / default
-const CARD_KEYS = ["patrol", "roadSecurity", "antiDrugs", "mp", "cyber", "senior", "highCommand", "default"];
-function cardBgFile(key) {
-    const names = [];
-    // بطاقة كبار الشخصيات: الملف card.jpg (أو png/webp) بجانب app.js له الأولوية على card-senior.*
-    if (key === "senior") for (const ext of ["jpg", "jpeg", "png", "webp"]) names.push("card." + ext);
-    for (const k of [key, key.toLowerCase()]) for (const ext of ["jpg", "jpeg", "png", "webp"]) names.push("card-" + k + "." + ext);
-    if (key === "default") names.push("card-bg.jpg", "card-bg2.jpg");
-    return names.find(n => fsCard.existsSync(nodePath.join(__dirname, n))) || null;
-}
-app.get("/card-bg/:key", (req, res) => {
-    const key = String(req.params.key || "");
-    if (!CARD_KEYS.includes(key)) return res.status(404).end();
-    const name = cardBgFile(key);
-    if (!name) return res.status(404).end();
-    res.sendFile(nodePath.join(__dirname, name), { maxAge: "5m" }, (err) => {
-        if (err && !res.headersSent) res.status(404).end();
-    });
-});
 
 function accView(a, withPw, viewerUid) {
     if (a.isSenior && a.uid !== viewerUid && !ownerUids.has(viewerUid)) withPw = false;
@@ -7253,7 +7215,13 @@ function bankWakePage() {
 // البنك يسأل عن الرتب (جدول الرواتب) ورتبة كل عسكري — بمفتاح سرّي بين الموقعين
 app.get("/api/bank/ranks", ensureBankKey, async (req, res) => {
     const jobs = await CzJob.find().sort({ createdAt: 1 }).lean();
-    res.json({ success: true, ranks: jobs.map(j => j.name) });
+    const jobNames = jobs.map(j => j.name);
+    // ?salary=1 => جدول الرواتب: وظائف المواطنين + الرتب العسكرية (بدون تكرار)
+    if (String(req.query.salary || "") === "1") {
+        const military = CONFIG.MILITARY_RANKS.filter(r => !jobNames.includes(r));
+        return res.json({ success: true, ranks: jobNames.concat(military), jobs: jobNames, military });
+    }
+    res.json({ success: true, ranks: jobNames });
 });
 // البنك يتحقق من البطاقة العسكرية للعضو (طلب بطاقة بنكية + ملف العضو للكبار)
 app.get("/api/bank/member-card", ensureBankKey, async (req, res) => {
@@ -7275,18 +7243,18 @@ app.get("/api/bank/member-card", ensureBankKey, async (req, res) => {
 });
 app.get("/api/bank/personnel-ranks", ensureBankKey, async (req, res) => {
     try {
-        {
-            const cl = await Citizen.find({ status: "approved", jobName: { $ne: null } }, { uid: 1, fullName: 1, jobName: 1 }).lean();
-            return res.json({ success: true, personnel: cl.map(c => ({ discord: c.uid, discordTag: c.fullName, rank: c.jobName, registeredName: c.fullName })) });
-        }
+        // المواطنون المقبولون (راتب حسب وظيفتهم)
+        const cl = await Citizen.find({ status: "approved", jobName: { $ne: null } }, { uid: 1, fullName: 1, jobName: 1 }).lean();
+        const personnel = cl.map(c => ({ discord: c.uid, discordTag: c.fullName, rank: c.jobName, registeredName: c.fullName, kind: "citizen" }));
+        const seen = new Set(personnel.map(x => String(x.discord)));
+        // العسكريون المسجلون في فلاش (راتب حسب رتبتهم العسكرية)
         const regUidsB = await getFlashRegisteredUids();
-        const list = await Personnel.find({ isBlocked: false, discord: { $in: regUidsB, $nin: Array.from(ownerUids) } }, "discord discordTag rank registeredName");
-        const personnel = list.map(p => ({
-            discord: p.discord,
-            discordTag: p.discordTag,
-            rank: p.rank,
-            registeredName: p.registeredName,
-        }));
+        const list = await Personnel.find({ isBlocked: false, isDismissed: { $ne: true }, discord: { $in: regUidsB, $nin: Array.from(ownerUids) } }, "discord discordTag rank registeredName");
+        for (const m of list) {
+            if (!m.rank || seen.has(String(m.discord))) continue;
+            seen.add(String(m.discord));
+            personnel.push({ discord: m.discord, discordTag: m.discordTag, rank: m.rank, registeredName: m.registeredName, kind: "military" });
+        }
         res.json({ success: true, personnel });
     } catch (e) {
         res.json({ success: false, msg: e.message });
@@ -12175,68 +12143,6 @@ app.get("/", (req, res) => {
     .auth-done p { color: #cbd5e1; line-height: 1.9; margin-bottom: 20px; }
     @media (max-width: 560px) { .auth-card { padding: 26px 18px 30px; border-radius: 22px; } .auth-grid { grid-template-columns: 1fr; } .auth-title { font-size: 26px; } }
 
-    .mc-wrap { max-width: 340px; margin: 0 auto; }
-    .mcard { position: relative; width: 100%; aspect-ratio: 736 / 418; border-radius: 12px; overflow: hidden; container-type: inline-size; box-shadow: 0 10px 30px rgba(0,0,0,0.45); direction: rtl; background: #fff; cursor: pointer; -webkit-tap-highlight-color: transparent; }
-    .mc-face { position: absolute; inset: 0; background: linear-gradient(135deg, #f4f8f5, #dfe9e3); transition: filter 0.3s, transform 0.3s; }
-    .mcard.locked .mc-face { filter: blur(15px); transform: scale(1.08); }
-    .mc-t { position: absolute; color: #0f172a; font-weight: 800; font-size: 3.5cqw; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; direction: rtl; text-shadow: 0 0 3px rgba(255,255,255,0.95), 0 0 6px rgba(255,255,255,0.8); transform: translateY(-50%); }
-    .mc-t { padding-right: 0.7cqw; box-sizing: border-box; }
-    .mc-t.num { direction: ltr; text-align: right; letter-spacing: 0.14em; text-shadow: 0 0 3px rgba(255,255,255,0.95); }
-    .mc-revoked { position: absolute; inset: 0; z-index: 3; display: flex; align-items: center; justify-content: center; font-size: 15cqw; font-weight: 800; color: rgba(220,38,38,0.55); transform: rotate(-18deg); pointer-events: none; text-shadow: 0 0 1cqw rgba(255,255,255,0.8); }
-    .mc-photo { position: absolute; object-fit: cover; border-radius: 0.8cqw; background: #e5e7eb; }
-    .mc-bc { position: absolute; display: flex; align-items: center; justify-content: flex-start; cursor: pointer; z-index: 1; -webkit-tap-highlight-color: transparent; text-decoration: none; }
-    .mc-bc img { height: 100%; aspect-ratio: 1; background: #fff; padding: 0.3cqw; border-radius: 0.6cqw; box-shadow: 0 0 0 0.25cqw rgba(15,23,42,0.35); }
-
-    /* ===== البطاقة العسكرية الفخمة ===== */
-    .lxc { background: radial-gradient(120% 140% at 85% 0%, #1d3a34 0%, #0e1f1c 45%, #070f0e 100%); color: #f3e3b3; font-family: inherit; }
-    .lxc::before { content: ''; position: absolute; inset: 0; background: repeating-linear-gradient(135deg, rgba(232,195,106,0.05) 0 0.4cqw, transparent 0.4cqw 2.2cqw); }
-    .lxc::after { content: ''; position: absolute; inset: 1.6cqw; border: 0.35cqw solid #d9b25c; border-radius: 2cqw; box-shadow: inset 0 0 0 0.35cqw rgba(0,0,0,0.5), inset 0 0 0 0.6cqw rgba(217,178,92,0.35); pointer-events: none; }
-    .lxc .lx-star { position: absolute; right: 5cqw; top: 3.6cqw; width: 7.4cqw; height: 7.4cqw; border-radius: 50%; background: radial-gradient(circle at 35% 30%, #f6df9b, #b88a2e); color: #1a2a25; display: flex; align-items: center; justify-content: center; font-size: 4.6cqw; box-shadow: 0 0 2cqw rgba(232,195,106,0.45); }
-    .lxc .lx-title { position: absolute; right: 14cqw; top: 4cqw; font-size: 3.3cqw; font-weight: 900; color: #f6df9b; letter-spacing: 0.02em; line-height: 1.2; }
-    .lxc .lx-sub { position: absolute; right: 14cqw; top: 8.6cqw; font-size: 1.9cqw; color: #bfae7a; letter-spacing: 0.18em; direction: ltr; text-align: right; }
-    .lxc .lx-chip { position: absolute; left: 5cqw; top: 4cqw; width: 8cqw; height: 6cqw; border-radius: 1cqw; background: linear-gradient(135deg, #f2d98f, #b88a2e 55%, #e8c36a); box-shadow: inset 0 0 0 0.25cqw rgba(0,0,0,0.35); }
-    .lxc .lx-chip::before { content: ''; position: absolute; inset: 1.2cqw 1.6cqw; border: 0.25cqw solid rgba(0,0,0,0.35); border-radius: 0.6cqw; }
-    .lxc .lx-photo { position: absolute; left: 5cqw; top: 14cqw; width: 19cqw; height: 25cqw; border-radius: 1.4cqw; object-fit: cover; background: #14231f; border: 0.4cqw solid #d9b25c; box-shadow: 0 0 2cqw rgba(0,0,0,0.6); }
-    .lxc .lx-nophoto { position: absolute; left: 5cqw; top: 14cqw; width: 19cqw; height: 25cqw; border-radius: 1.4cqw; background: rgba(255,255,255,0.05); border: 0.4cqw dashed rgba(217,178,92,0.5); display: flex; align-items: center; justify-content: center; font-size: 7cqw; color: rgba(217,178,92,0.5); }
-    .lxc .lx-f { position: absolute; right: 6cqw; width: 88cqw; display: flex; align-items: baseline; gap: 1.6cqw; white-space: nowrap; overflow: hidden; direction: rtl; }
-    .lxc .lx-f i { font-style: normal; font-size: 1.9cqw; color: #bfae7a; min-width: 11cqw; }
-    .lxc .lx-f b { font-weight: 800; color: #fff6d8; overflow: hidden; text-overflow: ellipsis; }
-    .lxc .lx-bar { position: absolute; right: 6cqw; bottom: 7.6cqw; width: 40cqw; height: 6.2cqw; display: block; padding: 0.6cqw 1cqw; border-radius: 0.8cqw; background: rgba(0,0,0,0.35); border: 0.2cqw solid rgba(217,178,92,0.4); }
-    .lxc .lx-bar svg { width: 100%; height: 100%; display: block; }
-    .lxc .lx-num { position: absolute; left: 5cqw; bottom: 7.8cqw; font-size: 3cqw; font-weight: 900; color: #f6df9b; direction: ltr; letter-spacing: 0.16em; text-align: left; }
-    .lxc .lx-warn { position: absolute; left: 4cqw; right: 4cqw; bottom: 3.4cqw; text-align: center; font-size: 1.55cqw; color: #e6b8a8; letter-spacing: 0.01em; }
-    .lxc .lx-numl { position: absolute; left: 5cqw; bottom: 11.8cqw; font-size: 1.7cqw; color: #bfae7a; direction: rtl; }
-    .mc-adm-in { position: absolute; z-index: 1; font-size: 2.1cqw; font-weight: 800; line-height: 1.2; color: #dc2626; background: rgba(255,255,255,0.88); border: 0.2cqw solid #dc2626; border-radius: 99px; padding: 0.15cqw 1.2cqw; pointer-events: none; }
-    .mc-warn { margin-top: 8px; padding: 7px 10px; border-radius: 10px; background: rgba(220,38,38,0.14); border: 1px solid rgba(248,113,113,0.55); color: #fca5a5; font-size: 12.5px; font-weight: 700; line-height: 1.7; text-align: center; }
-    .mc-adm { text-align: center; margin-top: 8px; font-weight: 800; font-size: 14px; color: #ef4444; }
-    .mcard.dbg .mc-t, .mcard.dbg .mc-photo, .mcard.dbg .mc-bc { outline: 1px dashed #d946ef; }
-    .mc-cover { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2cqw; background: rgba(15,30,60,0.28); cursor: pointer; z-index: 2; }
-    .mc-cover svg { width: 15cqw; height: 15cqw; filter: drop-shadow(0 2px 8px rgba(0,0,0,0.7)); }
-    .mc-cover span { color: #fff; font-weight: 800; font-size: 4.2cqw; text-shadow: 0 2px 8px rgba(0,0,0,0.75); }
-    .mcard:not(.locked) .mc-cover { display: none; }
-    .mc-remain { text-align: center; margin-top: 10px; font-size: 13px; font-weight: 700; color: var(--gold-soft); }
-    .mc-hint { display: none; text-align: center; margin-top: 8px; font-size: 12px; color: var(--muted); }
-    .mc-wrap.unlocked .mc-hint { display: block; }
-    .mc-info { margin-top: 14px; display: none; }
-    .mc-info.open { display: block; }
-    .mc-row { background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; margin-bottom: 8px; }
-    .mc-row-top { display: flex; align-items: center; justify-content: space-between; }
-    .mc-row span { color: var(--muted); font-size: 12px; }
-    .mc-row b { display: block; margin-top: 4px; font-weight: 700; color: #e2e8f0; font-size: 15px; word-break: break-word; user-select: text; }
-    .mc-copy { border: 1px solid var(--border); background: rgba(59,130,246,0.18); color: var(--gold-soft); border-radius: 8px; padding: 3px 10px; cursor: pointer; font-family: inherit; font-size: 11px; font-weight: 700; flex-shrink: 0; }
-    .mc-modal { width: 100%; max-width: 340px; margin: auto; }
-    #mc-page { display: none; position: fixed; inset: 0; z-index: 5000; background: #0a1628; flex-direction: column; }
-    #mc-page.open { display: flex; }
-    #mc-page .pp-bar { display: flex; align-items: center; padding: env(safe-area-inset-top,14px) 8px 10px; background: rgba(0,0,0,0.35); flex-shrink: 0; }
-    #mc-page .pp-back { background: none; border: none; color: #fff; font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 4px; cursor: pointer; padding: 10px 14px; -webkit-tap-highlight-color: transparent; font-family: inherit; }
-    #mc-page .mcp-body { flex: 1; overflow-y: auto; padding: 8px 14px 30px; }
-    #mc-page .mc-wrap { margin-top: 6px; }
-    #mc-full { display: none; position: fixed; inset: 0; z-index: 5200; background: rgba(0,0,0,0.95); align-items: center; justify-content: center; overflow: hidden; }
-    #mc-full.open { display: flex; }
-    #mc-full .mc-fs { width: min(96vw, calc(92vh * 736 / 418)); flex-shrink: 0; cursor: pointer; }
-    #mc-full .mc-fs .mcard { cursor: pointer; border-radius: 14px; }
-    @media (orientation: portrait) { #mc-full .mc-fs { width: min(92vh, calc(96vw * 736 / 418)); transform: rotate(90deg); } }
-    #mc-full .mc-x { position: absolute; top: env(safe-area-inset-top,12px); left: 12px; z-index: 2; background: rgba(255,255,255,0.14); color: #fff; border: none; border-radius: 50%; width: 40px; height: 40px; font-size: 18px; cursor: pointer; margin-top: 10px; }
     .acc-card .acc-title { font-size: 17px; font-weight: 800; color: var(--gold-soft); margin-bottom: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .acc-row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px dashed rgba(255,255,255,0.06); font-size: 13px; }
     .acc-row span { color: var(--muted); }
@@ -12352,7 +12258,7 @@ app.get("/", (req, res) => {
     #sp-modal { position: fixed; top: 0; left: 0; right: 0; height: 100%; background: #060d1a; z-index: 4000; display: none; align-items: flex-end; justify-content: center; overscroll-behavior: contain; }
     html.sp-lock, html.sp-lock body { overflow: hidden !important; }
     html.sp-lock #sp-fab { display: none !important; }
-    html.sp-lock #warn-banner, html.sp-lock nav, html.sp-lock .mobile-menu, html.sp-lock #app, html.sp-lock footer, html.sp-lock #photo-page, html.sp-lock #mc-page { visibility: hidden !important; }
+    html.sp-lock #warn-banner, html.sp-lock nav, html.sp-lock .mobile-menu, html.sp-lock #app, html.sp-lock footer, html.sp-lock #photo-page { visibility: hidden !important; }
     html.sp-lock body { background: #0a1628 !important; }
     #sp-modal.kb { align-items: stretch; }
     #sp-modal.kb #sp-box { height: 100%; border-radius: 0; }
@@ -12794,14 +12700,6 @@ ${__DEV_MODE__ ? '<div style="position:fixed;top:0;left:50%;transform:translateX
         <img id="photo-page-img" src="" style="display:none;">
     </div>
   </div>
-</div>
-<div id="mc-page">
-    <div class="pp-bar"><button class="pp-back" onclick="closeMcPage()">‹ رجوع</button></div>
-    <div class="mcp-body" id="mc-page-body"></div>
-</div>
-<div id="mc-full" onclick="closeMcFull()">
-    <button class="mc-x" onclick="closeMcFull(); event.stopPropagation();">✕</button>
-    <div class="mc-fs" id="mc-full-card"></div>
 </div>
 <button id="sp-fab" onclick="spOpen()" title="خدمة العملاء">🎧<span class="sp-badge" id="sp-fab-badge" style="display:none;"></span></button>
 <div id="sp-modal" onclick="if(event.target===this) spClose()">
@@ -17594,7 +17492,7 @@ async function submitReport(category) {
 }
 function renderCard() {
     document.getElementById('app').innerHTML = '<div style="margin-top:30px;">' +
-        cardBlock(ME, { id: 'me-card', hasProgress: true, nextRank: ME.nextRank, remaining: ME.pointsRemaining }) +
+        flCardHtml(ME, { nextRank: ME.nextRank, remaining: ME.pointsRemaining }, 'me-card') +
         '<div class="center" style="margin-top:16px;"><button class="btn gray sm" onclick="renderDashboard()">رجوع</button></div></div>';
 }
 function renderAdmin(startTab) {
@@ -18665,7 +18563,7 @@ async function sfView(discord) {
             return '<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-top:6px;font-size:13px;">' + cardEsc(n.text) +
                 (hasImg ? '<button class="btn sm gray" style="margin-top:6px;" data-d="' + cardEsc(p.discord) + '" data-n="' + cardEsc(n._id) + '" onclick="viewNotePhoto(this.dataset.d, this.dataset.n)">📷 عرض الصورة</button>' : '') + '</div>';
         }).join('') : '';
-        box.innerHTML = '<div style="margin-top:16px;">' + cardBlock(p, { hasProgress: !!progress, nextRank: progress && progress.nextRank, remaining: progress && progress.remaining }) + '</div>' +
+        box.innerHTML = '<div style="margin-top:16px;">' + flCardHtml(p, progress, 'file-card') + '</div>' +
             '<div class="id-card" style="margin-top:16px;"><div class="center" style="font-size:18px;font-weight:bold;color:var(--gold-soft);">' + cardEsc(p.registeredName || p.discordTag) + '</div>' +
             '<div class="center" style="font-size:12px;color:var(--muted);margin-bottom:10px;">ملف عسكري</div>' +
             '<table><tr><td>اليونت</td><td>' + cardEsc(p.unit || '-') + '</td></tr><tr><td>الرتبة</td><td>' + cardEsc(p.rank) + '</td></tr></table>' + notes + '</div>' +
@@ -19231,7 +19129,7 @@ async function viewSectorFile(discord) {
     try {
         const { personnel: p, progress } = await api('/api/sector/personnel/' + discord);
         box.innerHTML = \`
-            <div style="margin-top:16px;">\${cardBlock(p, { hasProgress: !!progress, nextRank: progress && progress.nextRank, remaining: progress && progress.remaining })}</div>
+            <div style="margin-top:16px;">\${flCardHtml(p, progress, 'file-card')}</div>
             <div class="id-card" style="margin-top:16px;">
                 <div class="center" style="font-size:18px;font-weight:bold;color:var(--gold-soft);">\${p.registeredName || p.discordTag}</div>
                 <div class="center" style="font-size:12px;color:var(--muted);margin-bottom:10px;">ملف عسكري</div>
@@ -19531,7 +19429,7 @@ async function viewMPFile(discord) {
     try {
         const { personnel: p, progress } = await api('/api/mp/personnel/' + discord);
         box.innerHTML = \`
-            <div style="margin-top:16px;">\${cardBlock(p, { hasProgress: !!progress, nextRank: progress && progress.nextRank, remaining: progress && progress.remaining })}</div>
+            <div style="margin-top:16px;">\${flCardHtml(p, progress, 'file-card')}</div>
             <div class="id-card" style="margin-top:16px;">
                 <div class="center" style="font-size:18px;font-weight:bold;color:var(--gold-soft);">\${p.registeredName || p.discordTag}</div>
                 <div class="center" style="font-size:12px;color:var(--muted);margin-bottom:10px;">ملف عسكري كامل</div>
@@ -20175,146 +20073,24 @@ function remainText(nextRank, remaining) {
     return nextRank ? ('متبقي ' + remaining + ' نقطة للوصول إلى رتبة ' + nextRank) : 'وصل لأعلى رتبة';
 }
 function cardFields(p) {
-    const notes = (p.notes || []).map(function (n) { return n.text; }).filter(Boolean);
-    const key = cardKeyOf(p);
     return {
-        key: key,
-        admin: !!(p.cardAdmin && SECTOR_LABELS[key]),
         revoked: !!p.cardRevoked,
         avatar: p.cardPhotoV ? '/api/card-photo/' + (p.discord || p.discordId) + '?v=' + p.cardPhotoV : null,
-        division: (p.sector && SECTOR_LABELS[p.sector]) || p.unit || '-',
         name: p.registeredName || p.discordTag || '-',
         rank: p.rank || '-',
         unit: p.unit || '-',
-        sector: (p.sector && SECTOR_LABELS[p.sector]) || '-',
-        num: p.cardNumber || '--------',
-        points: (p.points === undefined || p.points === null) ? '-' : String(p.points),
-        note: p.notes === undefined ? '—' : (notes.length ? notes[notes.length - 1] : 'لا توجد ملاحظات'),
-        notes: p.notes === undefined ? '—' : (notes.length ? notes.join(' | ') : 'لا توجد ملاحظات'),
+        num: p.cardNumber || '--------'
     };
 }
-const MC_DATA = {};
-const MC_OPT = {};
-const MC_ROWS = [['name', 'الاسم'], ['rank', 'الرتبة'], ['unit', 'اليونت'], ['num', 'رقم البطاقة'], ['points', 'النقاط'], ['sector', 'القطاع'], ['notes', 'الملاحظات']];
-// إحداثيات كل بطاقة (نسب مئوية من حجم البطاقة):
-// rows = مركز صفوف [الاسم، الرتبة، القطاع، رقم البطاقة] عمودياً | gx,gw = بداية وعرض خانات الكتابة
-// photo = [يسار، أعلى، عرض، ارتفاع] لمربع الصورة | bc = [يسار، أعلى، عرض، ارتفاع] لمنطقة الباركود
-const MC_LAYOUT = {
-    mp:           { rows: [36.5, 46.2, 55.9, 66.3], gx: 26.1, gw: 23.6, photo: [78.3, 27.3, 18.1, 36.8], bc: [23.4, 76.1, 52.0, 12.9], adm: [23.5, 71.3] },
-    patrol:       { rows: [34.8, 44.5, 54.6, 64.4], gx: 26.1, gw: 23.8, photo: [78.8, 26.2, 19.0, 35.5], bc: [23.4, 73.8, 53.0, 13.0], adm: [23.5, 69.0] },
-    antiDrugs:    { rows: [35.6, 45.4, 55.4, 65.6], gx: 24.7, gw: 24.0, photo: [77.5, 26.5, 18.1, 36.6], bc: [20.5, 75.4, 53.4, 12.5], adm: [23.5, 70.6] },
-    roadSecurity: { rows: [35.0, 45.2, 55.4, 65.4], gx: 24.2, gw: 24.3, photo: [77.6, 25.6, 18.6, 37.3], bc: [20.5, 74.4, 55.0, 13.4], adm: [23.5, 69.6] },
-    cyber:        { rows: [36.5, 46.2, 55.9, 66.3], gx: 26.1, gw: 23.6, photo: [78.3, 27.3, 18.1, 36.8], bc: [23.4, 76.1, 52.0, 12.9], adm: [23.5, 71.3] },
-    // بطاقة كبار المسؤولين / كبار الشخصيات «عدم التعرض» (الخلفية الجديدة 1679×937): ثلاث خانات فقط (الاسم / الرتبة / الوحدة-اليونت في خانة «الكود العسكري») بدون رقم البطاقة وبدون القطاع، والنص أبيض لأن الخانات داكنة
-    // cols = [يسار، عرض] لكل صف: القيمة تبدأ بعد الفاصل الذهبي وتنتهي ملاصقة للكلمة (الاسم: / الرتبة: / الكود العسكري:) — خانة الكود أضيق لأن كلمتها أطول
-    senior:       { rows: [35.6, 44.9, 54.0, 54.0], unitRow: true, tc: '#ffffff', gx: 69.7, gw: 21.2, cols: [[69.7, 21.2], [69.7, 21.3], null, [69.7, 12.8]], photo: [83.2, 5.3, 13.9, 19.1], bc: [23.8, 80.6, 49.2, 7.2], adm: [23.5, 71.3] },
-    highCommand:  { rows: [36.5, 46.2, 55.9, 66.3], gx: 26.1, gw: 23.6, photo: [78.3, 27.3, 18.1, 36.8], bc: [23.4, 76.1, 52.0, 12.9], adm: [23.5, 71.3] },
-    default:      { rows: [36.5, 46.2, 55.9, 66.3], gx: 26.1, gw: 23.6, photo: [78.3, 27.3, 18.1, 36.8], bc: [23.4, 76.1, 52.0, 12.9], adm: [23.5, 71.3] }
-};
-const MC_BG_V = '2';
-function cardKeyOf(p) {
-    if (p && p.cardKey && MC_LAYOUT[p.cardKey]) return p.cardKey;
-    return (p && p.sector && MC_LAYOUT[p.sector]) ? p.sector : 'default';
-}
-function mcFs(txt, isNum, gw) {
-    const n = String(txt == null ? '' : txt).length;
-    if (isNum) return '2.7cqw';
-    let fs = n <= 10 ? 2.9 : n <= 14 ? 2.5 : n <= 18 ? 2.1 : n <= 24 ? 1.7 : 1.4;
-    // خانة ضيقة (مثل خانة «الكود العسكري» بجنب الكلمة الطويلة): نصغّر الخط على قد عرض الخانة عشان ما ينقص النص
-    if (gw > 0) fs = Math.max(1.1, Math.min(fs, Math.round(((gw - 0.9) / (0.52 * Math.max(n, 1))) * 100) / 100));
-    return fs + 'cqw';
-}
-function mcFit(node) { node.style.fontSize = mcFs(node.textContent, node.classList.contains('num'), parseFloat(node.getAttribute('data-gw')) || 0); }
-function mcWarn() { return '<div class="mc-warn">⚠️ تنبيه: هذي البطاقة مخصصة للمحاكاة واللعب فقط، وليست بطاقة حقيقية ولا تمت للواقع بصلة.</div>'; }
-function mcAdminTag(f) { return f.admin ? '<div class="mc-adm">🔴 إداري</div>' : ''; }
-function mcDebug(on) { document.querySelectorAll('.mcard').forEach(function (c) { c.classList.toggle('dbg', on !== false); }); }
-function lxFs(txt, base) {
-    var n = String(txt == null ? '' : txt).length;
-    var f = n <= 12 ? base : n <= 18 ? base * 0.84 : n <= 26 ? base * 0.68 : base * 0.55;
-    return f.toFixed(2) + 'cqw';
-}
-function lxBarcode(num) {
-    var s = String(num), x = 0, r = '';
-    for (var i = 0; i < s.length; i++) {
-        var d = (s.charCodeAt(i) % 10) + 1;
-        r += '<rect x=\"' + x + '\" y=\"0\" width=\"' + (1 + (d % 3)) + '\" height=\"20\"/>';
-        x += 2 + (d % 3) + (d % 2);
-        r += '<rect x=\"' + x + '\" y=\"0\" width=\"1\" height=\"20\"/>';
-        x += 2;
-    }
-    return '<svg viewBox=\"0 0 ' + x + ' 20\" preserveAspectRatio=\"none\" fill=\"#e8c36a\">' + r + '</svg>';
-}
-// البطاقة العسكرية الفخمة (تصميم برمجي بدون صور خلفية)
-function mcFaceLux(f) {
-    var photo = '';
-    var row = function (top, label, val, fs) { return '<div class=\"lx-f\" style=\"top:' + top + 'cqw;font-size:' + lxFs(val, fs) + ';\"><i>' + label + '</i><b>' + cardEsc(val) + '</b></div>'; };
-    var okNum = /^[0-9]{8}$/.test(String(f.num));
-    var bars = lxBarcode(f.num);
-    var bc = okNum ? '<a class=\"lx-bar\" href=\"/verify-card/' + f.num + '\" target=\"_blank\" rel=\"noopener\" onclick=\"event.stopPropagation()\" aria-label=\"التحقق من البطاقة\">' + bars + '</a>' : '<div class=\"lx-bar\">' + bars + '</div>';
-    return '<div class=\"mc-face lxc\">' +
-        '<div class=\"lx-star\">★</div><div class=\"lx-title\">بطاقة عسكرية</div><div class=\"lx-sub\">MILITARY ID</div><div class=\"lx-chip\"></div>' +
-        row(15.5, 'الاسم', f.name, 3.4) +
-        row(22.5, 'الرتبة', f.rank, 3.1) +
-        row(29.5, 'اليونت', f.unit, 3.1) +
-        row(36.5, 'القطاع', f.sector, 3.1) +
-        photo + bc +
-        '<div class=\"lx-warn\">⚠️ للمحاكاة واللعب فقط — ليست بطاقة حقيقية ولا تمت للواقع بصلة</div><div class=\"lx-numl\">رقم البطاقة</div><div class=\"lx-num\">' + cardEsc(f.num) + '</div>' +
-        (f.admin ? '<div class=\"mc-adm-in\" style=\"right:6cqw;top:3cqw;\">إداري</div>' : '') +
-        (f.revoked ? '<div class=\"mc-revoked\">ملغاة</div>' : '') +
-    '</div>';
-}
-function mcFace(f) {
-    const L = MC_LAYOUT[f.key] || MC_LAYOUT['default'];
-    const box = function (a) { return 'left:' + a[0] + '%;top:' + a[1] + '%;width:' + a[2] + '%;height:' + a[3] + '%;'; };
-    // idx = رقم الصف (0 الاسم، 1 الرتبة، 2 القطاع، 3 الأخير). L.cols[idx] = [يسار، عرض] خاص بكل صف (لو ما انحطت يستخدم gx/gw)
-    const t = function (k, y, txt, cls, idx) {
-        const c = (L.cols && L.cols[idx]) || [L.gx, L.gw];
-        return '<div class="mc-t ' + cls + '" data-k="' + k + '" data-gw="' + c[1] + '" style="left:' + c[0] + '%;width:' + c[1] + '%;top:' + y + '%;font-size:' + mcFs(txt, k === 'num', c[1]) + ';' + (L.tc ? 'color:' + L.tc + ';text-shadow:0 1px 3px rgba(0,0,0,0.85);' : '') + '">' + cardEsc(txt) + '</div>';
-    };
-    const photo = f.avatar ? '<img class="mc-photo" src="' + cardEsc(f.avatar) + '" alt="" onerror="this.remove()" style="' + box(L.photo) + '">' : '';
-    const bc = /^[0-9]{8}$/.test(String(f.num))
-        ? '<a class="mc-bc" href="/verify-card/' + f.num + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" style="' + box(L.bc) + '" aria-label="التحقق من البطاقة"></a>'
-        : '';
-    return '<div class="mc-face" style="background: url(/card-bg/' + f.key + '?v=' + MC_BG_V + ') center / 100% 100% no-repeat, linear-gradient(135deg, #f4f8f5, #dfe9e3);">' +
-        t('name', L.rows[0], f.name, 'name', 0) +
-        t('rank', L.rows[1], f.rank, 'rank', 1) +
-        (L.unitRow ? '' : t('division', L.rows[2], f.division, 'sector', 2)) +
-        (L.unitRow ? t('unit', L.rows[3], f.unit, 'sector', 3) : t('num', L.rows[3], f.num, 'num', 3)) +
-        photo + bc +
-        (f.admin ? '<div class="mc-adm-in" style="right:' + L.adm[0] + '%;top:' + L.adm[1] + '%;">إداري</div>' : '') +
-        (f.revoked ? '<div class="mc-revoked">ملغاة</div>' : '') +
-    '</div>';
-}
-function cardBlock(p, o) {
-    o = o || {};
-    const id = o.id || ('mc' + Math.random().toString(36).slice(2, 8));
-    MC_DATA[id] = p; MC_OPT[id] = o;
-    const f = cardFields(p);
-    const remain = o.hasProgress
-        ? '<div class="mc-remain"' + (o.remainId ? ' id="' + o.remainId + '"' : '') + '>' + remainText(o.nextRank, o.remaining) + '</div>'
-        : '';
-    const eye = '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z"/><circle cx="12" cy="12" r="3.2"/></svg>';
-    return '<div class="mc-wrap" id="' + id + '" data-mc="' + id + '">' +
-        '<div class="mcard locked" onclick="mcTap(this)">' +
-            mcFace(f) +
-            '<div class="mc-cover">' + eye + '<span>عرض البطاقة</span></div>' +
-        '</div>' + mcWarn() + mcAdminTag(f) + remain +
-        '<div class="mc-hint">اضغط على البطاقة لعرضها كاملة ⤢</div>' +
-    '</div>';
+// البطاقة العسكرية (النظام الجديد) داخل ملفات الأعضاء عند الإدارة / كبار المسؤولين
+function flCardHtml(p, progress, id) {
+    czInjectStyle();
+    var q = Object.assign({}, p, { nextRank: progress ? progress.nextRank : null });
+    var o = { id: id || ('fc' + Math.random().toString(36).slice(2, 8)) };
+    if (progress) { o.nextRank = progress.nextRank; o.remaining = progress.remaining; } else { o.preview = true; }
+    return '<div class="cz-wrap" style="padding:0;">' + czMilCard(q, o) + '</div>';
 }
 // ===== صورة البطاقة: العضو يرفع، والإدارة تراجع =====
-function cpSectionHtml() {
-    return ''; // صور البطاقات انشالت
-    const st = ME.cardPhotoStatus;
-    let h = '<div class="mc-row" id="cp-box"><div class="mc-row-top"><span>📷 صورة البطاقة</span></div>';
-    if (st === 'pending') h += '<b style="color:#fbbf24;">⏳ صورتك قيد المراجعة من الإدارة</b><img src="/api/card-photo-pending/' + ME.discordId + '?t=' + Date.now() + '" alt="" style="width:72px;height:84px;object-fit:cover;border-radius:8px;margin-top:8px;display:block;">';
-    else if (st === 'rejected') h += '<b style="color:#f87171;">❌ انرفضت صورتك' + (ME.cardPhotoReason ? ': ' + cardEsc(ME.cardPhotoReason) : '') + '</b>';
-    else if (ME.cardPhotoV) h += '<b style="color:#4ade80;">✅ صورتك معتمدة وتظهر على البطاقة</b>';
-    else h += '<b style="color:var(--muted);">ما حطيت صورة للبطاقة</b>';
-    h += '<button class="btn sm" style="margin-top:8px;" onclick="cpPick()">' + ((ME.cardPhotoV || st) ? 'تغيير الصورة' : 'إضافة صورة') + '</button>' +
-        '<input type="file" id="cp-file" accept="image/*" style="display:none" onchange="cpUpload(this)"></div>';
-    return h;
-}
 function cpPick() { const i = document.getElementById('cp-file'); if (i) i.click(); }
 function cpCompress(file) {
     return new Promise(function (resolve, reject) {
@@ -20342,8 +20118,6 @@ async function cpUpload(inp) {
         await api('/api/card-photo', { method: 'POST', body: JSON.stringify({ photo: data }) });
         ME.cardPhotoStatus = 'pending'; ME.cardPhotoReason = null;
         toast('انرسلت الصورة للمراجعة ✅');
-        const pg = document.getElementById('mc-page');
-        if (pg && pg.classList.contains('open')) { const id = pg.getAttribute('data-src'); if (id) openMcPage(id); }
     } catch (e) { toast(e.message || 'تعذر رفع الصورة'); }
     inp.value = '';
 }
@@ -20605,116 +20379,13 @@ function cardCtlCopy(n) {
     try { navigator.clipboard.writeText(String(n)).then(function () { toast('اننسخ رقم البطاقة 📋'); }, function () { toast(String(n)); }); }
     catch (e) { toast(String(n)); }
 }
-function mcTap(el) {
-    const w = el.closest('.mc-wrap');
-    if (!w) return;
-    const id = w.getAttribute('data-mc');
-    if (el.closest('#mc-page')) { openMcFull(id); return; }
-    const card = w.querySelector('.mcard');
-    card.classList.remove('locked');
-    w.classList.add('unlocked');
-    openMcPage(id);
-}
-function mcHideCard() { closeMcPage(); }
-function mcInfoHtml(id) {
-    const p = MC_DATA[id]; const o = MC_OPT[id] || {};
-    const f = cardFields(p);
-    let info = '';
-    MC_ROWS.forEach(function (r) {
-        info += '<div class="mc-row"><div class="mc-row-top"><span>' + r[1] + '</span><button class="mc-copy" onclick="mcCopy(this)">📋 نسخ</button></div><b data-k="' + r[0] + '">' + cardEsc(f[r[0]]) + '</b></div>';
-    });
-    if (id === 'me-card' || id === 'home-card') info += cpSectionHtml();
-    const remain = o.hasProgress ? '<div class="mc-remain">' + remainText(o.nextRank, o.remaining) + '</div>' : '';
-    return '<div class="mc-wrap unlocked" data-mc="' + id + '">' +
-        '<div class="mcard" onclick="mcTap(this)">' + mcFace(f) + '</div>' + mcWarn() + mcAdminTag(f) +
-        '<div class="mc-hint">اضغط على البطاقة لعرضها كاملة ⤢</div>' + remain +
-        '<div class="mc-info open">' + info +
-            '<div class="row" style="gap:8px;margin-top:4px;">' +
-                '<button class="btn gray sm" onclick="mcHideCard()">🙈 إخفاء البطاقة</button>' +
-                '<button class="btn sm" onclick="mcCopyAll(this)">📋 نسخ كل المعلومات</button>' +
-            '</div>' +
-        '</div></div>';
-}
-function openMcPage(id) {
-    if (!MC_DATA[id]) return;
-    const pg = document.getElementById('mc-page');
-    document.getElementById('mc-page-body').innerHTML = mcInfoHtml(id);
-    pg.setAttribute('data-src', id);
-    if (!pg.classList.contains('open')) {
-        pg.classList.add('open');
-        history.pushState({ mcPage: true }, '');
-    }
-}
-function closeMcPage(skipHistory) {
-    const pg = document.getElementById('mc-page');
-    if (!pg.classList.contains('open')) return;
-    const id = pg.getAttribute('data-src');
-    pg.classList.remove('open');
-    pg.removeAttribute('data-src');
-    document.getElementById('mc-page-body').innerHTML = '';
-    const w = id ? document.getElementById(id) : null;
-    if (w) {
-        const card = w.querySelector('.mcard');
-        if (card) card.classList.add('locked');
-        w.classList.remove('unlocked');
-    }
-    if (!skipHistory && history.state && history.state.mcPage) history.back();
-}
-function openMcFull(id) {
-    const p = MC_DATA[id];
-    if (!p) return;
-    const box = document.getElementById('mc-full-card');
-    box.innerHTML = '<div class="mcard">' + mcFace(cardFields(p)) + '</div>';
-    document.getElementById('mc-full').classList.add('open');
-    history.pushState({ mcFull: true }, '');
-}
-function closeMcFull(skipHistory) {
-    const fl = document.getElementById('mc-full');
-    if (!fl.classList.contains('open')) return;
-    fl.classList.remove('open');
-    document.getElementById('mc-full-card').innerHTML = '';
-    if (!skipHistory && history.state && history.state.mcFull) history.back();
-}
-window.addEventListener('popstate', function (e) {
-    const st = e.state || {};
-    if (!st.mcFull) closeMcFull(true);
-    if (!st.mcFull && !st.mcPage) closeMcPage(true);
-});
-function mcFallbackCopy(txt) {
-    const ta = document.createElement('textarea');
-    ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta); ta.select();
-    try { document.execCommand('copy'); } catch (e) {}
-    ta.remove();
-}
-function mcCopyText(txt) {
-    const done = function () { toast('تم النسخ ✅'); };
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(txt).then(done).catch(function () { mcFallbackCopy(txt); done(); });
-    } else { mcFallbackCopy(txt); done(); }
-}
-function mcCopy(btn) { mcCopyText(btn.closest('.mc-row').querySelector('b').textContent); }
-function mcCopyAll(btn) {
-    const info = btn.closest('.mc-info');
-    const lines = [];
-    info.querySelectorAll('.mc-row').forEach(function (r) {
-        lines.push(r.querySelector('span').textContent + ': ' + r.querySelector('b').textContent);
-    });
-    mcCopyText(lines.join(String.fromCharCode(10)));
-}
 function cardUpdate(rootId, p) {
-    MC_DATA[rootId] = p;
+    const root = document.getElementById(rootId);
+    if (!root) return;
     const f = cardFields(p);
-    const roots = [document.getElementById(rootId)];
-    const pg = document.getElementById('mc-page');
-    if (pg && pg.classList.contains('open') && pg.getAttribute('data-src') === rootId) roots.push(pg);
-    roots.forEach(function (root) {
-        if (!root) return;
-        root.querySelectorAll('[data-k]').forEach(function (n) {
-            const k = n.getAttribute('data-k');
-            if (f[k] !== undefined) n.textContent = f[k];
-            if (n.classList.contains('mc-t')) mcFit(n);
-        });
+    root.querySelectorAll('[data-k]').forEach(function (n) {
+        const k = n.getAttribute('data-k');
+        if (f[k] !== undefined) n.textContent = f[k];
     });
 }
 function closeCardModal() { const o = document.getElementById('mc-modal-ov'); if (o) o.remove(); }
@@ -20724,7 +20395,7 @@ function openCardModal(discord) {
     closeCardModal();
     const ov = document.createElement('div');
     ov.id = 'mc-modal-ov'; ov.className = 'acc-ov';
-    ov.innerHTML = '<div class="mc-modal">' + cardBlock(p, {}) +
+    ov.innerHTML = '<div style="width:100%;max-width:420px;margin:auto;">' + flCardHtml(p, null, 'cm-card') +
         '<div class="center" style="margin-top:14px;"><button class="btn gray sm" onclick="closeCardModal()">إغلاق</button></div></div>';
     document.body.appendChild(ov);
     ov.onclick = function (e) { if (e.target === ov) closeCardModal(); };
@@ -25089,6 +24760,5 @@ process.on("uncaughtException", (err) => {
 
 app.listen(CONFIG.PORT, "0.0.0.0", () => {
     console.log(`🚀 ${CONFIG.SITE_NAME} server running on port ${CONFIG.PORT}`);
-    bankWakeSoft(); // فلاش قام → صحّي البنك معه
 });
 
