@@ -4426,6 +4426,34 @@ app.get("/api/senior/personnel", ensureSeniorAdmin, async (req, res) => {
     }) });
 });
 
+// بحث موحّد: كل الحسابات (عسكر + مواطنين)
+app.get("/api/senior/accounts-search", ensureSeniorAdmin, async (req, res) => {
+    const q = String(req.query.q || "").trim().slice(0, 60);
+    if (!q) return res.json({ list: [] });
+    await ensureCardNumbers();
+    const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    const owners = Array.from(ownerUids);
+    const regUids = await getFlashRegisteredUids();
+    const visible = isOwnerUid(req.user.id) && owners.length
+        ? { $or: [{ discord: { $in: regUids, $nin: owners } }, { discord: { $in: owners } }] }
+        : { discord: { $in: regUids, $nin: owners } };
+    const [mil, cits] = await Promise.all([
+        Personnel.find({ $and: [visible, { $or: [{ registeredName: rx }, { unit: rx }, { discordTag: rx }, { cardNumber: rx }] }] }, { registeredName: 1, unit: 1, rank: 1, discordTag: 1, discord: 1, cardNumber: 1 }).sort({ createdAt: -1 }).limit(60).lean(),
+        Citizen.find({ $or: [{ fullName: rx }, { email: rx }, { civilId: rx }, { discordTag: rx }, { uid: q }] }, { fullName: 1, email: 1, civilId: 1, jobName: 1, uid: 1, status: 1 }).sort({ createdAt: -1 }).limit(60).lean(),
+    ]);
+    const list = mil.map(p => ({ kind: "military", id: p.discord, name: p.registeredName || p.discordTag || p.discord, sub: [p.rank, p.unit].filter(Boolean).join(" • "), num: p.cardNumber || null }))
+        .concat(cits.map(c => ({ kind: "citizen", id: c.uid, name: c.fullName || c.email, sub: [c.jobName || "مواطن", c.email].filter(Boolean).join(" • "), num: c.civilId || null, suspended: c.status === "suspended" })));
+    res.json({ list });
+});
+app.get("/api/senior/citizen/:uid/file", ensureSeniorAdmin, async (req, res) => {
+    const c = await Citizen.findOne({ uid: String(req.params.uid) }).lean();
+    if (!c) return res.status(404).json({ error: "المواطن غير موجود" });
+    res.json({ citizen: {
+        ...czView(c), email: c.email, status: c.status, discordId: c.discordId || null, discordTag: c.discordTag || null,
+        password: decryptText(c.passwordEnc), cardRevokedAt: c.cardRevokedAt || null, cardRevokedByName: c.cardRevokedByName || null,
+        cardRevokedReason: c.cardRevokedReason || null, jobId: c.jobId || null,
+    } });
+});
 app.get("/api/senior/personnel/:discord/file", ensureSeniorAdmin, async (req, res) => {
     if (ownerUids.has(req.params.discord) && !isOwnerUid(req.user.id)) return res.status(404).json({ error: "غير موجود" });
     await ensureCardNumbers();
@@ -16233,6 +16261,7 @@ function czInjectStyle() {
         '.cz-bcwrap svg{display:block;width:100%;height:48px}' +
         '.cz-bcwrap small{display:block;text-align:center;color:#0f172a;font:700 11px/1.4 Consolas,monospace;letter-spacing:5px;margin-top:2px}' +
         '.cz-bcwrap em{display:block;text-align:center;color:#64748b;font-style:normal;font-size:10px;letter-spacing:0}' +
+        '.cz-mil:after{display:none!important;animation:none!important}.cz-mil .cz-bcwrap{z-index:3;-webkit-tap-highlight-color:transparent;touch-action:manipulation;cursor:pointer}.cz-mil{-webkit-tap-highlight-color:transparent;touch-action:manipulation}' +
         '.cz-mil-s{max-width:380px;margin-left:auto;margin-right:auto}' +
         '.cz-mil-s .cz-mil{padding:12px 14px;border-radius:16px}' +
         '.cz-mil-s .cz-id-title{font-size:16px}.cz-mil-s .cz-id-sub{font-size:9px;letter-spacing:1.5px}' +
@@ -16243,7 +16272,7 @@ function czInjectStyle() {
         '.cz-mil-s .cz-chip{width:30px;height:22px}.cz-mil-s .cz-mil-stripes i{width:26px;height:4px}' +
         '.cz-mil-s .cz-bcwrap{margin-top:8px;padding:5px 8px 3px;cursor:pointer}.cz-mil-s .cz-bcwrap svg{height:34px}.cz-mil-s .cz-bcwrap small{font-size:10px;letter-spacing:4px}' +
         '.cz-mil-s .cz-mil-badge{font-size:10px;padding:3px 9px}.cz-mil-s .cz-mil-void{font-size:26px}' +
-        '.cz-zoom{position:fixed;inset:0;z-index:99995;background:rgba(2,6,15,.86);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:16px;cursor:pointer;animation:czzin .18s ease}' +
+        '.cz-zoom{position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483000;background:rgba(2,6,15,.86);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:16px;cursor:pointer;animation:czzin .18s ease}' +
         '@keyframes czzin{from{opacity:0}to{opacity:1}}' +
         '.cz-zoom .cz-mil-wrap{width:100%;max-width:640px}' +
         '.cz-zoom .cz-mil{padding:26px 28px;border-radius:26px;margin:0;cursor:pointer;box-shadow:0 30px 80px rgba(0,0,0,.75),0 0 0 1px rgba(250,204,21,.35)}' +
@@ -16323,14 +16352,17 @@ function czMilCard(p, o) {
         '</div>';
 }
 function czMilZoom() {
-    var p = window.CZ_MIL_P || (typeof ME !== 'undefined' ? ME : null);
-    if (!p) return;
-    czMilZoomClose();
-    var z = document.createElement('div');
-    z.className = 'cz-zoom'; z.id = 'cz-zoom';
-    z.onclick = czMilZoomClose;
-    z.innerHTML = czMilCard(p, { id: 'cz-zoom-card', big: true }) + '<div class="cz-zoom-hint">اضغط بأي مكان للإغلاق</div>';
-    document.body.appendChild(z);
+    try {
+        var p = window.CZ_MIL_P || (typeof ME !== 'undefined' ? ME : null);
+        if (!p) return;
+        czMilZoomClose();
+        var z = document.createElement('div');
+        z.className = 'cz-zoom'; z.id = 'cz-zoom';
+        z.innerHTML = czMilCard(p, { id: 'cz-zoom-card', big: true }) + '<div class="cz-zoom-hint">اضغط بأي مكان للإغلاق</div>';
+        document.body.appendChild(z);
+        // نقفلها بعد لحظة قصيرة عشان نفس الضغطة ما تقفلها
+        setTimeout(function () { z.onclick = czMilZoomClose; }, 250);
+    } catch (e) { try { toast('تعذر تكبير البطاقة: ' + e.message); } catch (x) {} }
 }
 function czMilZoomClose() { var z = document.getElementById('cz-zoom'); if (z) z.remove(); }
 document.addEventListener('keydown', function (e) { if (e.key === 'Escape') czMilZoomClose(); });
@@ -17578,7 +17610,7 @@ function renderAdmin(startTab) {
             <div class="tab" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div>
             <div class="tab" onclick="adminTab('accounts', this)">✅ الحسابات المقبولة</div>
             <div class="tab" onclick="adminTab('personnel', this)">ملفات العسكريين</div>
-            <div class="tab" onclick="adminTab('sfile', this)">📇 عرض ملف عسكري</div>
+            <div class="tab" onclick="adminTab('sfile', this)">📇 عرض ملفات الحسابات</div>
             <div class="tab" id="tab-cards" onclick="adminTab('cards', this)">🪪 تحكم بطاقة عسكرية</div>
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
@@ -18516,7 +18548,7 @@ var SF = { t: null, seq: 0 };
 function sfOpen() {
     var box = document.getElementById('admin-content');
     if (!box) return;
-    box.innerHTML = '<div class="card"><input id="sf-q" placeholder="🔍 ابحث بالاسم / اليونت / رقم البطاقة..." oninput="sfSearch()"><div id="sf-results"></div></div><div id="sf-view"></div>';
+    box.innerHTML = '<div class="card"><input id="sf-q" placeholder="🔍 ابحث في كل الحسابات (عسكر / مواطنين): اسم • بريد • يونت • رقم بطاقة أو هوية..." oninput="sfSearch()"><div id="sf-results"></div></div><div id="sf-view"></div>';
 }
 function sfSearch() {
     clearTimeout(SF.t);
@@ -18528,13 +18560,15 @@ async function sfRunSearch() {
     var q = inp.value.trim();
     if (!q) { box.innerHTML = ''; return; }
     var my = ++SF.seq, list;
-    try { list = (await api('/api/senior/personnel?q=' + encodeURIComponent(q), { noLock: true })).list; }
+    try { list = (await api('/api/senior/accounts-search?q=' + encodeURIComponent(q), { noLock: true })).list; }
     catch (e) { if (my === SF.seq && document.getElementById('sf-results')) document.getElementById('sf-results').innerHTML = '<p style="color:#f87171;font-size:13px;">' + cyEsc(e.message) + '</p>'; return; }
     box = document.getElementById('sf-results');
     if (my !== SF.seq || !box) return;
     box.innerHTML = list.length ? list.map(function (p) {
-        return '<div class="card" style="padding:8px 12px;margin-top:6px;"><div class="row"><span>' + cyEsc(p.registeredName || p.discordTag) + ' <span style="color:var(--muted);font-size:12px;">(' + cyEsc(p.unit || '-') + ')</span></span>' +
-            '<button class="btn sm" data-d="' + cyEsc(p.discord) + '" onclick="sfView(this.dataset.d)">عرض الملف</button></div></div>';
+        var cz = p.kind === 'citizen';
+        return '<div class="card" style="padding:8px 12px;margin-top:6px;"><div class="row"><span><span class="badge ' + (cz ? 'pending' : 'approved') + '">' + (cz ? '🧑 مواطن' : '🪖 عسكري') + '</span> ' + cyEsc(p.name || '-') +
+            ' <span style="color:var(--muted);font-size:12px;">(' + cyEsc(p.sub || '-') + ')</span>' + (p.suspended ? ' <span style="color:#f87171;font-size:12px;">موقوف</span>' : '') + '</span>' +
+            '<button class="btn sm" data-d="' + cyEsc(p.id) + '" onclick="' + (cz ? 'sfViewCz' : 'sfView') + '(this.dataset.d)">عرض الملف</button></div></div>';
     }).join('') : '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>';
 }
 function sfRow(k, v) { return '<tr><td style="white-space:nowrap;">' + k + '</td><td style="word-break:break-all;">' + v + '</td></tr>'; }
@@ -18588,6 +18622,36 @@ function sfExtra(d) {
     ) : sfRow('البصمة', '<span style="color:var(--muted);">ما سجّل حضور ولا مرة</span>');
     out += '<div class="id-card" style="margin-top:16px;"><div style="font-size:15px;font-weight:bold;color:var(--gold-soft);margin-bottom:8px;">🕒 البصمة</div><table>' + attRows + '</table></div>';
     return out;
+}
+async function sfViewCz(uid) {
+    var box = document.getElementById('sf-view');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    try {
+        czInjectStyle();
+        var c = (await api('/api/senior/citizen/' + encodeURIComponent(uid) + '/file')).citizen;
+        var yn = function (b) { return b ? 'نعم' : 'لا'; };
+        var lic = { approved: 'معتمدة', pending: 'قيد المراجعة', revoked: 'مسحوبة', none: 'لا يوجد' }[c.licenseStatus] || '-';
+        var veh = (c.vehicles || []).length ? c.vehicles.map(function (v) { return v.name; }).join('، ') : 'لا توجد';
+        var rows = accRow('الاسم الكامل', c.fullName || '-') +
+            accRow('البريد', c.email || '-') +
+            accPwRow(c.password) +
+            accRow('العمر', c.age == null ? '-' : c.age) +
+            accRow('الجنسية', c.nationality || '-') +
+            accRow('نوع الحساب', 'مواطن') +
+            accRow('حالة الحساب', c.status === 'suspended' ? 'موقوف' : 'مقبول') +
+            accRow('رقم الهوية', c.civilId || '-') +
+            accRow('الوظيفة', c.jobName || 'بدون وظيفة') +
+            accRow('الهوية ملغاة', yn(c.cardRevoked)) +
+            (c.cardRevoked ? accRow('سبب الإلغاء', c.cardRevokedReason || '-') : '') +
+            accRow('الرخصة', lic) +
+            accRow('رقم الرخصة', c.licenseNo || '-') +
+            accRow('المركبات', veh) +
+            accRow('الديسكورد', c.discordTag || c.discordId || '-') +
+            accRow('تاريخ التسجيل', sfFull(c.createdAt));
+        box.innerHTML = '<div style="margin-top:16px;"><div class="cz-wrap" style="padding:0;">' + czIdCard(c) + '</div></div>' +
+            '<div class="id-card" style="margin-top:16px;"><div style="font-size:15px;font-weight:bold;color:var(--gold-soft);margin-bottom:8px;">🔐 معلومات الحساب (مواطن)</div>' + rows + '</div>';
+    } catch (e) { box.innerHTML = '<div class="card" style="color:#f87171;">' + cardEsc(e.message) + '</div>'; }
 }
 async function sfView(discord) {
     var box = document.getElementById('sf-view');
