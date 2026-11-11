@@ -320,7 +320,6 @@ const MilitarySalarySchema = new mongoose.Schema({
     ranksSalaries: { type: Map, of: Number, default: {} }, // رتبة -> راتب
     lastPayoutAt: { type: Date, default: null },
     nextPayoutAt: { type: Date, default: null },
-    fundAccount: { type: String, default: '' },         // رقم حساب التمويل (يحدده المالك): منه تنسحب الرواتب
 });
 const MilitarySalarySettings = mongoose.model("MilitarySalarySettings", MilitarySalarySchema);
 
@@ -338,30 +337,20 @@ function periodToMs(value, unit) {
     return v * 24 * 60 * 60 * 1000; // days (افتراضي)
 }
 
-// يصرف الراتب لقائمة عساكر (advance = دفعة مسبقة لأشخاص محددين، ما تغيّر موعد الدفعة القادمة)
+// يصرف الراتب لقائمة عساكر/مواطنين (advance = دفعة مسبقة لأشخاص محددين، ما تغيّر موعد الدفعة القادمة)
+// الراتب يُودَع مباشرة في حساب الشخص بدون خصم من أي حساب تمويل
 async function payMilitarySalaries(list, settings, advance) {
-    let paidCount = 0, totalPaid = 0, shortCount = 0;
+    let paidCount = 0, totalPaid = 0;
     const tag = advance ? ' (دفعة مسبقة)' : '';
-    // الرواتب تنسحب من حساب التمويل (يحدده المالك) وتنزل للعساكر — مو من بنك فلاش
-    const fund = settings.fundAccount ? await Account.findOne({ accountNumber: settings.fundAccount }) : null;
-    if (!fund) return { paidCount: 0, totalPaid: 0, shortCount: 0, noFund: true };
-    let stop = false;
     for (const p of list) {
         const salary = settings.ranksSalaries.get(p.rank);
-        if (!salary || salary <= 0) continue; // ما فيه راتب محدد لهذي الرتبة
+        if (!salary || salary <= 0) continue; // ما فيه راتب محدد لهذي الرتبة/الوظيفة
 
         const acc = await Account.findOne({ discord: p.discord });
         if (!acc || acc.isFrozen) continue; // ما عنده حساب بنكي أو حسابه مجمد
-        if (String(acc._id) === String(fund._id)) continue; // صاحب حساب التمويل ما ياخذ من نفسه
-        if (stop) { shortCount++; continue; }
-
-        // خصم ذرّي من حساب التمويل (لو الرصيد ما يكفي نوقف)
-        const taken = await Account.findOneAndUpdate({ _id: fund._id, balance: { $gte: salary } }, { $inc: { balance: -salary } });
-        if (!taken) { stop = true; shortCount++; continue; }
 
         await Account.findByIdAndUpdate(acc._id, { $inc: { balance: salary } });
         await Transaction.create({
-            fromAccount: fund.accountNumber,
             toDiscord: p.discord,
             toAccount: acc.accountNumber,
             amount: salary,
@@ -376,14 +365,7 @@ async function payMilitarySalaries(list, settings, advance) {
         paidCount++;
         totalPaid += salary;
     }
-    if (paidCount > 0) {
-        await Transaction.create({ fromDiscord: fund.discord, fromAccount: fund.accountNumber, amount: totalPaid, type: 'withdraw', note: `صرف رواتب المواطنين${tag} (${paidCount} شخص)` });
-        await Notification.create({ discord: fund.discord, message: `💸 سُحب ${totalPaid.toLocaleString()} $ من حسابك لرواتب المواطنين (${paidCount} شخص).`, type: 'info' });
-    }
-    if (shortCount > 0) {
-        await Notification.create({ discord: fund.discord, message: `⚠️ رصيد حساب تمويل الرواتب ما كفى: ما انصرف راتب ${shortCount} شخص. عبّي الحساب.`, type: 'warning' });
-    }
-    return { paidCount, totalPaid, shortCount };
+    return { paidCount, totalPaid, shortCount: 0 };
 }
 
 // تنفيذ عملية صرف رواتب المواطنين: يجيب رتبة كل عسكري من موقع فلاش
@@ -402,8 +384,7 @@ async function runMilitarySalaryPayout() {
         return { success: false, msg: "تعذر الاتصال بموقع فلاش: " + e.message };
     }
 
-    const { paidCount, totalPaid, shortCount, noFund } = await payMilitarySalaries(personnel, settings, false);
-    if (noFund) return { success: false, msg: "ما تم تحديد حساب تمويل الرواتب — المالك يحدده من تاب رواتب المواطنين" };
+    const { paidCount, totalPaid, shortCount } = await payMilitarySalaries(personnel, settings, false);
 
     const now = new Date();
     const nextPayoutAt = new Date(now.getTime() + periodToMs(settings.periodValue, settings.periodUnit));
@@ -411,7 +392,7 @@ async function runMilitarySalaryPayout() {
 
     await BankLog.create({
         action: 'military_salary_payout',
-        description: `صرف رواتب المواطنين: ${paidCount} حساب بإجمالي ${totalPaid.toLocaleString()} $${shortCount ? ` — ${shortCount} ما انصرف لهم (رصيد التمويل ما كفى)` : ''}`,
+        description: `صرف رواتب المواطنين: ${paidCount} حساب بإجمالي ${totalPaid.toLocaleString()} $`,
         performedBy: 'system',
         performedByTag: 'نظام رواتب المواطنين'
     });
@@ -1128,7 +1109,7 @@ function startAdminPolling() {
 `;
 
 const BANK_EXT2_JS = String.raw`
-// ═══════════ إضافات: ألوان بأزرار، CVV للكبار، مرفوضات، قروض نشطة، تمويل الرواتب، أدوات المالك ═══════════
+// ═══════════ إضافات: ألوان بأزرار، CVV للكبار، مرفوضات، قروض نشطة، أدوات المالك ═══════════
 var BK2_COLORS = [
     ['blue', 'أزرق', '#1d4ed8'], ['green', 'أخضر', '#15803d'], ['red', 'أحمر', '#b91c1c'],
     ['gold', 'ذهبي', '#b45309'], ['purple', 'بنفسجي', '#6d28d9'], ['black', 'أسود', '#1e293b']
@@ -1340,34 +1321,6 @@ async function bk2LoanAct(id, action) {
     try { loadAdminLoans(); } catch (e) {}
 }
 
-// ── تمويل الرواتب (المالك يحدد الحساب، والباقي يشوفون الحالة فقط) ──
-(function () {
-    var _lms = loadMilitarySalaryPanel;
-    loadMilitarySalaryPanel = async function () {
-        await _lms();
-        var sb = document.getElementById('military-salary-status'); if (!sb) return;
-        var old = document.getElementById('ms-fund-box'); if (old) old.remove();
-        var box = document.createElement('div'); box.id = 'ms-fund-box'; box.className = 'toggle-box'; box.style.cssText = 'display:block;margin-top:10px';
-        sb.insertAdjacentElement('afterend', box);
-        if (window.ownerPower) {
-            var d = await bk2Json('/api/owner/salary-funding');
-            box.innerHTML = '<b style="color:#fde047">💰 حساب تمويل الرواتب (تنسحب منه الرواتب وتنزل للعساكر)</b>' +
-                '<p style="color:#94a3b8;font-size:.82rem;margin:6px 0">' + (d.fundAccount ? ('الحساب: <b>' + bk2Esc(d.name) + '</b> — ' + bk2Esc(d.fundAccount) + ' — الرصيد: <b>' + (d.balance || 0).toLocaleString() + ' $</b>') : '<span style="color:#fca5a5">ما تم تحديد حساب — الرواتب ما راح تنصرف لين تحدده.</span>') + '</p>' +
-                '<div style="display:flex;gap:6px;flex-wrap:wrap"><input id="ms-fund-input" placeholder="رقم الحساب (6 أرقام)" maxlength="6" inputmode="numeric" value="' + bk2Esc(d.fundAccount || '') + '" style="width:170px;margin-bottom:0">' +
-                '<button class="btn btn-green" onclick="bk2SaveFund()">💾 حفظ</button>' + (d.fundAccount ? '<button class="btn btn-red" onclick="bk2SaveFund(true)">إلغاء</button>' : '') + '</div><div id="ms-fund-msg" style="margin-top:6px"></div>';
-        } else {
-            var st = await fetch((window.BANK_BASE || '') + '/api/superadmin/military-salary/status').then(function (r) { return r.json(); }).catch(function () { return {}; });
-            box.innerHTML = st.fundSet ? '<span style="color:#4ade80">💰 الرواتب تنسحب من حساب تمويل محدد ✅</span>' : '<span style="color:#fca5a5">⚠️ ما فيه حساب تمويل محدد (يحدده المالك) — الرواتب ما تنصرف.</span>';
-        }
-    };
-})();
-async function bk2SaveFund(clear) {
-    var v = clear ? '' : (document.getElementById('ms-fund-input').value || '').trim();
-    var d = await bk2Json('/api/owner/salary-funding', { method: 'POST', body: { accountNumber: v } });
-    var m = document.getElementById('ms-fund-msg'); if (m) m.innerHTML = '<span style="color:' + (d.success ? '#4ade80' : '#fca5a5') + '">' + bk2Esc(d.msg || '') + '</span>';
-    if (d.success) setTimeout(loadMilitarySalaryPanel, 700);
-}
-
 // ── الإشعارات: الإنذار يوصل أول ما يدخل (حتى لو جاه وهو برّا) مع صوت، ويستمر لين يضغط «فهمت» ──
 var BK2_ACK = {};
 (function () {
@@ -1440,7 +1393,6 @@ async function bkOwnerInit() {
         b('#be123c', '📡 العمليات الحية', 'bk2BarClose();bk2OpenLive()') +
         b('#0369a1', '👥 الحسابات', 'bk2BarClose();openAdminPanel();switchAdminTab(\'accounts\')') +
         b('#1d4ed8', '🕹️ تحكم البطاقات', 'bk2BarClose();openAdminPanel();switchAdminTab(\'card-control\')') +
-        b('#b45309', '💰 تمويل الرواتب', 'bk2BarClose();openAdminPanel();switchAdminTab(\'military-salary\')') +
         b('#374151', '👻 وضع التخفي', 'bk2ToggleStealth()', 'bk2-stealth-btn') +
         b('#b91c1c', '🚨 إغلاق البنك', 'bk2ToggleLock()', 'bk2-lock-btn') + '</div>' + toggle;
     document.body.appendChild(bar);
@@ -2292,7 +2244,7 @@ app.put('/api/admin/loans/:id/:action', isStaffOrAbove, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// ✨ إضافات جديدة: التخفي، تمويل الرواتب من حساب المالك، البطاقات المرفوضة، تأكيد الإشعار
+// ✨ إضافات جديدة: التخفي، البطاقات المرفوضة، تأكيد الإشعار
 // ═══════════════════════════════════════════════════════════════════════
 
 // ── المالك (مخفي): وسيط يسمح للمالك الحقيقي فقط ──
@@ -2344,31 +2296,6 @@ app.put('/api/notifications/:id/read', checkMaintenance, async (req, res) => {
     } catch (e) { res.json({ success: false }); }
 });
 
-// ── تمويل الرواتب: حساب يحدده المالك فقط، الرواتب تنسحب منه وتنزل للعساكر ──
-app.get('/api/owner/salary-funding', ownerOnly, async (req, res) => {
-    try {
-        const s = await getMilitarySalarySettings();
-        let acc = null;
-        if (s.fundAccount) acc = await Account.findOne({ accountNumber: s.fundAccount }, { discordTag: 1, accountNumber: 1, balance: 1 }).lean();
-        res.json({ success: true, fundAccount: s.fundAccount || '', name: acc ? acc.discordTag : '', balance: acc ? acc.balance : 0 });
-    } catch (e) { res.json({ success: false, msg: e.message }); }
-});
-app.post('/api/owner/salary-funding', ownerOnly, async (req, res) => {
-    try {
-        const num = String((req.body || {}).accountNumber || '').trim();
-        const s = await getMilitarySalarySettings();
-        if (!num) {
-            await MilitarySalarySettings.updateOne({ _id: s._id }, { fundAccount: '' });
-            return res.json({ success: true, msg: 'تم إلغاء حساب التمويل (الرواتب ما تنصرف لين تحدد حساب)' });
-        }
-        const acc = await Account.findOne({ accountNumber: num });
-        if (!acc) return res.json({ success: false, msg: 'رقم الحساب غير موجود' });
-        await MilitarySalarySettings.updateOne({ _id: s._id }, { fundAccount: num });
-        await BankLog.create({ action: 'salary_funding_set', description: 'تحديد حساب تمويل رواتب المواطنين', performedBy: req.user.id, performedByTag: 'كبار المسؤولين' });
-        res.json({ success: true, msg: '✅ تم تحديد حساب التمويل: ' + acc.discordTag + ' (' + acc.accountNumber + ')', name: acc.discordTag, balance: acc.balance });
-    } catch (e) { res.json({ success: false, msg: e.message }); }
-});
-
 // ── البطاقات المرفوضة (كبار المسؤولين): عرض + حذف، والحذف يشيلها من العضو كذلك ──
 app.get('/api/superadmin/cards/rejected', isBankSuperAdmin, async (req, res) => {
     try {
@@ -2398,14 +2325,15 @@ app.post('/api/superadmin/cards/rejected-clear', isBankSuperAdmin, async (req, r
 // ── APIs رواتب المواطنين (ربط مع موقع فلاش — كبار المسؤولين فقط) ──────────────
 app.get('/api/superadmin/military-salary/ranks', isBankSuperAdmin, async (req, res) => {
     try {
-        const data = await flashGet('/api/bank/ranks');
+        // وظائف المواطنين (الموظفين) + الرتب العسكرية من فلاش
+        const data = await flashGet('/api/bank/ranks?salary=1');
         if (!data.success) return res.json({ success: false, msg: "تعذر جلب الرتب من موقع فلاش" });
 
         const settings = await getMilitarySalarySettings();
         const salaries = {};
         data.ranks.forEach(r => { salaries[r] = settings.ranksSalaries.get(r) || 0; });
 
-        res.json({ success: true, ranks: data.ranks, salaries });
+        res.json({ success: true, ranks: data.ranks, jobs: data.jobs || data.ranks, military: data.military || [], salaries });
     } catch (e) {
         res.json({ success: false, msg: "تعذر الاتصال بموقع فلاش: " + e.message });
     }
@@ -2421,7 +2349,6 @@ app.get('/api/superadmin/military-salary/status', isBankSuperAdmin, async (req, 
         ranksSalaries: Object.fromEntries(settings.ranksSalaries),
         lastPayoutAt: settings.lastPayoutAt,
         nextPayoutAt: settings.nextPayoutAt,
-        fundSet: !!settings.fundAccount,
     });
 });
 
@@ -2506,9 +2433,8 @@ app.post('/api/superadmin/military-salary/pay-selected', isBankSuperAdmin, async
         const set = new Set(uids);
         const chosen = data.personnel.filter(p => set.has(String(p.discord)));
         if (!chosen.length) return res.json({ success: false, msg: "ما لقينا الأشخاص المختارين" });
-        const { paidCount, totalPaid, shortCount, noFund } = await payMilitarySalaries(chosen, settings, true);
-        if (noFund) return res.json({ success: false, msg: "ما تم تحديد حساب تمويل الرواتب (يحدده المالك)" });
-        if (!paidCount) return res.json({ success: false, msg: shortCount ? "رصيد حساب التمويل ما يكفي" : "ما تم الصرف: تأكد أن لهم حسابات غير مجمدة ورواتب محددة لوظائفهم" });
+        const { paidCount, totalPaid } = await payMilitarySalaries(chosen, settings, true);
+        if (!paidCount) return res.json({ success: false, msg: "ما تم الصرف: تأكد أن لهم حسابات غير مجمدة ورواتب محددة لوظائفهم" });
         await BankLog.create({
             action: 'military_salary_advance',
             description: `صرف راتب مسبق لـ ${paidCount} شخص بإجمالي ${totalPaid.toLocaleString()} $`,
@@ -5857,12 +5783,17 @@ app.use(async (req, res) => {
             }
 
             msRanksCache = ranksData.ranks;
-            container.innerHTML = ranksData.ranks.map(r => \`
+            const msRow = (r, icon) => \`
                 <div class="toggle-box">
-                    <span>🎖️ \${r}</span>
+                    <span>\${icon} \${r}</span>
                     <input type="number" min="0" class="ms-rank-input" data-rank="\${r}" value="\${status.ranksSalaries?.[r] ?? ranksData.salaries[r] ?? 0}" style="width:120px; margin-bottom:0;" />
                 </div>
-            \`).join('');
+            \`;
+            const msJobs = ranksData.jobs || ranksData.ranks;
+            const msMil = ranksData.military || [];
+            container.innerHTML =
+                (msJobs.length ? '<h4 style="margin:6px 0;color:#fde047;">👔 رواتب الموظفين (وظائف المواطنين)</h4>' + msJobs.map(r => msRow(r, '💼')).join('') : '') +
+                (msMil.length ? '<h4 style="margin:14px 0 6px;color:#4ade80;">🎖️ رواتب الرتب العسكرية (من فلاش)</h4>' + msMil.map(r => msRow(r, '🎖️')).join('') : '');
 
             document.getElementById('ms-period-value').value = status.periodValue || 7;
             document.getElementById('ms-period-unit').value = status.periodUnit || 'days';
@@ -6174,29 +6105,4 @@ const PORT = process.env.PORT || 7697;
 
 app.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Server running on port ${PORT}`);
-    startKeepAlive();
 });
-
-// ═══════════ نظام التصحية: يخلي البنك (وفلاش) صاحي دايم ═══════════
-// Render المجاني ينيّم الموقع بعد 15 دقيقة بدون زوار، فنرسل طلب خفيف كل 9 دقايق.
-// ملاحظة: هذا يمنع النوم طول ما البنك شغال. لو نام لأي سبب (إعادة تشغيل مثلاً) ما يقدر يصحّي نفسه،
-// عشان كذا يُنصح بخدمة خارجية (UptimeRobot) تفحص /healthz كل 5 دقايق.
-function startKeepAlive() {
-    const selfUrl = String(process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
-    const targets = [];
-    if (selfUrl) targets.push({ name: 'البنك', url: selfUrl + '/healthz' });
-    else console.log('⚠️ التصحية: ما لقيت رابط البنك (RENDER_EXTERNAL_URL أو SELF_URL) — ضيف SELF_URL في إعدادات Render');
-    if (String(process.env.KEEP_FLASH_ALIVE || 'true') !== 'false') targets.push({ name: 'فلاش', url: FLASH_API + '/healthz' });
-    if (!targets.length) return;
-    async function pingAll() {
-        for (const t of targets) {
-            try {
-                const r = await fetch(t.url, { signal: AbortSignal.timeout(20000), headers: { 'User-Agent': 'bank-keepalive' } });
-                if (r.status >= 500) console.log('⚠️ التصحية: ' + t.name + ' رد ' + r.status);
-            } catch (e) { console.log('⚠️ التصحية: تعذر الوصول لـ' + t.name + ' (' + (e && e.message ? e.message : e) + ')'); }
-        }
-    }
-    setTimeout(pingAll, 60 * 1000);
-    setInterval(pingAll, 9 * 60 * 1000);
-    console.log('💓 نظام التصحية شغال (كل 9 دقايق): ' + targets.map(t => t.name).join(' + '));
-}
