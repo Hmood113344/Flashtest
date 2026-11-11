@@ -1737,6 +1737,16 @@ client.once("clientReady", onBotReady);
 setInterval(() => { try { if (!botReadyDone && client.isReady && client.isReady()) onBotReady(); } catch (e) {} }, 5000);
 
 let botLoginError = null, botLoginStartedAt = 0;
+// نبضة البوت: كل استضافة تشغّل الملف (الأساسية والثانية) تسجل حالة اتصال البوت عندها بالداتابيس، وفحص الاتصال يعرضها كلها
+const BotBeat = mongoose.model("BotBeat", new mongoose.Schema({ host: { type: String, unique: true }, ready: Boolean, hasToken: Boolean, tag: String, error: String, startedAt: Date, at: Date }));
+const BOT_HOST_ID = process.env.RENDER_EXTERNAL_HOSTNAME || process.env.HOSTNAME || require("os").hostname();
+async function botBeat() {
+    try {
+        const ready = !!(botReady || (client.isReady && client.isReady()));
+        await BotBeat.updateOne({ host: BOT_HOST_ID }, { $set: { ready, hasToken: !!CONFIG.BOT_TOKEN, tag: client.user ? client.user.tag : null, error: ready ? null : (botLoginError || null), at: new Date() }, $setOnInsert: { startedAt: new Date() } }, { upsert: true });
+    } catch (e) {}
+}
+setInterval(botBeat, 20000); setTimeout(botBeat, 8000);
 client.on("error", e => { botLoginError = e && e.message ? e.message : String(e); console.log("❌ خطأ البوت:", botLoginError); });
 if (CONFIG.BOT_TOKEN) {
     botLoginStartedAt = Date.now();
@@ -1933,7 +1943,7 @@ app.use((req, res, next) => {
     if (!req.user || req.user.kind !== "citizen") return next();
     const p = req.path;
     if (!/^\/(api|bank)(\/|$)/.test(p)) return next();
-    if (/^\/(api\/(me|events|citizen|cz|bank\/sso|bank\/status|pwa\/ping)|bank)(\/|$)/.test(p)) return next();
+    if (/^\/(api\/(me|events|fnotif|citizen|cz|bank\/sso|bank\/status|pwa\/ping)|bank)(\/|$)/.test(p)) return next();
     return res.status(403).json({ error: "هذا القسم غير متاح للمواطنين" });
 });
 app.get("/api/me", (req, res, next) => { if (req.user && req.user.kind === "citizen") return czMe(req, res); next(); });
@@ -2273,6 +2283,15 @@ app.get("/api/cz/citizens", ensureAnyAdmin, async (req, res) => {
     const cond = q ? { $or: [{ civilId: q }, { fullName: { $regex: q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" } }] } : {};
     const list = await Citizen.find(cond, { passwordHash: 0, passwordEnc: 0, answers: 0 }).sort({ createdAt: -1 }).limit(100).lean();
     res.json({ list: list.map(c => ({ ...czView(c), status: c.status, jobId: c.jobId, email: c.email })) });
+});
+// حذف حساب مواطن نهائياً (كبار المسؤولين)
+app.delete("/api/cz/citizens/:uid", ensureSeniorAdmin, async (req, res) => {
+    const c = await Citizen.findOne({ uid: String(req.params.uid) });
+    if (!c) return res.status(404).json({ error: "المواطن غير موجود" });
+    await Citizen.deleteOne({ uid: c.uid });
+    await CzReq.deleteMany({ uid: c.uid });
+    await logEvent({ action: "حذف حساب مواطن", actorId: req.user.id, actorTag: req.user.username, details: (c.fullName || "") + " — " + (c.email || "") + (c.civilId ? " — هوية " + c.civilId : "") });
+    res.json({ ok: true });
 });
 app.post("/api/cz/citizens/:uid/civil-id", ensureAnyAdmin, async (req, res) => {
     const id = String((req.body || {}).civilId || "").trim();
@@ -2889,7 +2908,18 @@ app.post("/api/admin/registrations/:uid/reject", ensureAnyAdmin, async (req, res
 app.get("/api/senior/accounts", ensureSeniorAdmin, async (req, res) => {
     const status = req.query.status === "rejected" ? "rejected" : "approved";
     const list = await Account.find({ status, ...(isOwnerUid(req.user.id) ? {} : { isOwner: { $ne: true } }) }).sort({ createdAt: -1 }).lean();
-    res.json({ list: list.map(a => accView(a, true, req.user.id)) });
+    const out = list.map(a => ({ ...accView(a, true, req.user.id), kind: "military" }));
+    // الحسابات المقبولة تشمل المواطنين (والوظائف الجانبية تعتبر مواطن)
+    if (status === "approved") {
+        const have = new Set(out.map(a => a.uid));
+        const cits = await Citizen.find({}).sort({ createdAt: -1 }).lean();
+        for (const c of cits) {
+            if (have.has(c.uid)) continue;
+            out.push({ uid: c.uid, kind: "citizen", email: c.email, fullName: c.fullName, age: c.age, nationality: c.nationality, status: "approved", suspended: c.status === "suspended", civilId: c.civilId || null, jobName: c.jobName || null, licenseStatus: c.licenseStatus || "none", vehiclesCount: (c.vehicles || []).length, createdAt: c.createdAt, password: decryptText(c.passwordEnc) });
+        }
+        out.sort((x, y) => new Date(y.createdAt || 0) - new Date(x.createdAt || 0));
+    }
+    res.json({ list: out });
 });
 
 app.post("/api/senior/accounts/:uid/update", ensureSeniorAdmin, async (req, res) => {
@@ -5283,6 +5313,10 @@ app.get("/api/senior/bot-status", ensureSeniorAdmin, async (req, res) => {
         }
         out.channels.push(r);
     }
+    try {
+        const beats = await BotBeat.find({}).lean();
+        out.instances = beats.map(b => { const age = Math.max(0, Math.round((Date.now() - new Date(b.at).getTime()) / 1000)); return { host: b.host, me: b.host === BOT_HOST_ID, ready: !!b.ready && age < 90, hasToken: !!b.hasToken, tag: b.tag || null, error: b.error || null, ageSec: age }; });
+    } catch (e) { out.instances = []; }
     res.json(out);
 });
 
@@ -7253,7 +7287,7 @@ async function supportBanned(uid, gt) {
 const SUPPORT_BANNED_MSG = "تم حظرك من خدمة الدعم الفني";
 
 const SUPPORT_AI_PROMPT = [
-    "أنت مساعد خدمة العملاء لموقع «سيرفر وزارة الداخلية» (فلاش) — موقع لعب أدوار (ماين كرافت/محاكاة) لإدارة عساكر وزارة الداخلية، ولا يمت للواقع بصلة.",
+    "أنت مساعد خدمة العملاء لموقع «فلاش» — موقع لعب أدوار (روبلوكس Greenville/محاكاة) لإدارة العسكر والمواطنين والمخالفات، ولا يمت للواقع بصلة.",
     "الموقع فيه: تسجيل حساب بالبريد وموافقة الإدارة عليه، تسجيل المخالفات بالصور، نقاط ورتب عسكرية، طلبات الإجازات، البطاقة العسكرية، القطاعات (الدوريات، أمن الطرق، مكافحة المخدرات)، الشرطة العسكرية، ولوحات للإدارة وقادة القطاعات.",
     "الموقع يتحدّث لحظياً بدون ريفرش، فلا تنصح بتحديث الصفحة كحل أول.",
     "",
@@ -12489,6 +12523,23 @@ app.get("/", (req, res) => {
     .tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
     .tab { background: rgba(255,255,255,0.04); border: 1px solid rgba(59,130,246,0.3); padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; color: #94a3b8; }
     .tab.active { background: var(--green2); color: #fff; border-color: var(--green2); }
+    .tab-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .tab-group { background: rgba(255,255,255,0.03); border: 1px solid rgba(59,130,246,0.22); border-radius: 14px; padding: 10px 12px; }
+    .tab-group-title { font-size: 12.5px; font-weight: 800; color: var(--gold-soft); margin-bottom: 8px; }
+    .tab-group .tabs { margin: 0; gap: 6px; }
+    .cz-hd { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 14px; padding: 12px 14px; border-radius: 16px; background: linear-gradient(135deg,#0a1f4d,#123a8f); border: 1px solid rgba(250,204,21,.35); box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+    .cz-hd-name { font-size: 18px; font-weight: 800; color: #fff; }
+    .cz-hd-sub { font-size: 12px; color: #fde68a; margin-top: 2px; }
+    .cz-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
+    .cz-actions .btn, .cz-actions .btn.sm { width: 100%; padding: 12px 8px; font-size: 14px; margin: 0; text-align: center; }
+    .acc-mil { border-color: rgba(34,197,94,.55) !important; background: linear-gradient(135deg, rgba(34,197,94,.12), rgba(0,0,0,0) 60%), var(--panel); }
+    .acc-cit { border-color: rgba(59,130,246,.65) !important; background: linear-gradient(135deg, rgba(59,130,246,.16), rgba(0,0,0,0) 60%), var(--panel); }
+    .acc-mil .acc-tag.kind { background: rgba(34,197,94,.2); color: #86efac; border-color: rgba(34,197,94,.5); }
+    .acc-cit .acc-tag.kind { background: rgba(59,130,246,.22); color: #93c5fd; border-color: rgba(59,130,246,.55); }
+    .acc-kinds { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+    .acc-kinds button { flex: 1 1 auto; padding: 7px 10px; border-radius: 10px; border: 1px solid rgba(148,163,184,.3); background: rgba(255,255,255,.04); color: #cbd5e1; font-size: 12.5px; cursor: pointer; }
+    .acc-kinds button.on { background: rgba(59,130,246,.3); color: #fff; border-color: rgba(59,130,246,.7); }
+    .tab-group .tab { padding: 8px 12px; border-radius: 10px; white-space: nowrap; text-align: center; }
     .log-item { background: rgba(255,255,255,0.02); border: 1px solid rgba(59,130,246,0.2); border-radius: 8px; padding: 10px 15px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; font-size: 0.88rem; }
     .id-card { background: linear-gradient(135deg, #1e3a5f, #0f2848); border: 2px solid var(--gold); border-radius: 20px; padding: 22px; max-width: 400px; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
     .rank-line { display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 15px; color: var(--gold-soft); margin: 10px 0; font-weight: bold; }
@@ -12605,13 +12656,14 @@ app.get("/", (req, res) => {
     .lxc .lx-chip::before { content: ''; position: absolute; inset: 1.2cqw 1.6cqw; border: 0.25cqw solid rgba(0,0,0,0.35); border-radius: 0.6cqw; }
     .lxc .lx-photo { position: absolute; left: 5cqw; top: 14cqw; width: 19cqw; height: 25cqw; border-radius: 1.4cqw; object-fit: cover; background: #14231f; border: 0.4cqw solid #d9b25c; box-shadow: 0 0 2cqw rgba(0,0,0,0.6); }
     .lxc .lx-nophoto { position: absolute; left: 5cqw; top: 14cqw; width: 19cqw; height: 25cqw; border-radius: 1.4cqw; background: rgba(255,255,255,0.05); border: 0.4cqw dashed rgba(217,178,92,0.5); display: flex; align-items: center; justify-content: center; font-size: 7cqw; color: rgba(217,178,92,0.5); }
-    .lxc .lx-f { position: absolute; right: 6cqw; width: 62cqw; display: flex; align-items: baseline; gap: 1.6cqw; white-space: nowrap; overflow: hidden; direction: rtl; }
+    .lxc .lx-f { position: absolute; right: 6cqw; width: 88cqw; display: flex; align-items: baseline; gap: 1.6cqw; white-space: nowrap; overflow: hidden; direction: rtl; }
     .lxc .lx-f i { font-style: normal; font-size: 1.9cqw; color: #bfae7a; min-width: 11cqw; }
     .lxc .lx-f b { font-weight: 800; color: #fff6d8; overflow: hidden; text-overflow: ellipsis; }
-    .lxc .lx-bar { position: absolute; right: 6cqw; bottom: 4.4cqw; width: 40cqw; height: 6.2cqw; display: block; padding: 0.6cqw 1cqw; border-radius: 0.8cqw; background: rgba(0,0,0,0.35); border: 0.2cqw solid rgba(217,178,92,0.4); }
+    .lxc .lx-bar { position: absolute; right: 6cqw; bottom: 7.6cqw; width: 40cqw; height: 6.2cqw; display: block; padding: 0.6cqw 1cqw; border-radius: 0.8cqw; background: rgba(0,0,0,0.35); border: 0.2cqw solid rgba(217,178,92,0.4); }
     .lxc .lx-bar svg { width: 100%; height: 100%; display: block; }
-    .lxc .lx-num { position: absolute; left: 5cqw; bottom: 4.6cqw; font-size: 3cqw; font-weight: 900; color: #f6df9b; direction: ltr; letter-spacing: 0.16em; text-align: left; }
-    .lxc .lx-numl { position: absolute; left: 5cqw; bottom: 8.6cqw; font-size: 1.7cqw; color: #bfae7a; direction: rtl; }
+    .lxc .lx-num { position: absolute; left: 5cqw; bottom: 7.8cqw; font-size: 3cqw; font-weight: 900; color: #f6df9b; direction: ltr; letter-spacing: 0.16em; text-align: left; }
+    .lxc .lx-warn { position: absolute; left: 4cqw; right: 4cqw; bottom: 3.4cqw; text-align: center; font-size: 1.55cqw; color: #e6b8a8; letter-spacing: 0.01em; }
+    .lxc .lx-numl { position: absolute; left: 5cqw; bottom: 11.8cqw; font-size: 1.7cqw; color: #bfae7a; direction: rtl; }
     .mc-adm-in { position: absolute; z-index: 1; font-size: 2.1cqw; font-weight: 800; line-height: 1.2; color: #dc2626; background: rgba(255,255,255,0.88); border: 0.2cqw solid #dc2626; border-radius: 99px; padding: 0.15cqw 1.2cqw; pointer-events: none; }
     .mc-warn { margin-top: 8px; padding: 7px 10px; border-radius: 10px; background: rgba(220,38,38,0.14); border: 1px solid rgba(248,113,113,0.55); color: #fca5a5; font-size: 12.5px; font-weight: 700; line-height: 1.7; text-align: center; }
     .mc-adm { text-align: center; margin-top: 8px; font-weight: 800; font-size: 14px; color: #ef4444; }
@@ -13227,6 +13279,7 @@ const MILITARY_RANKS = ${JSON.stringify(CONFIG.MILITARY_RANKS)};
    نفس الشي للوحة الأمن السيبراني: CYBER_PANEL_ENABLED.
    ═══════════════════════════════════════════════════════════════════════════ */
 var OFFICERS_CORPS_ENABLED = false;
+var FL_PUSH_ENABLED = false; // الإشعارات من برا التطبيق (Web Push) انشالت — إشعارات الجرس داخل الموقع باقية
 var CYBER_PANEL_ENABLED = false;
 var SECTOR_LABELS = { mp: 'الشرطة العسكرية' };
 // القطاعات تتحدث لحظياً (إضافة/حذف من الكبار) بدون ريفرش
@@ -16716,6 +16769,7 @@ async function czStart() {
     czInjectStyle(); czSetNav();
     try { flPushInit(); } catch (e) {}
     try { spReconnect(); } catch (e) {}
+    try { fnStart(); } catch (e) {}
     try { fetch('/api/pwa/ping?sa=' + (flStandalone() ? 1 : 0)); } catch (e) {}
     await czGo(CZ.tab || 'home');
     if (CZ.timer) clearInterval(CZ.timer);
@@ -16880,15 +16934,23 @@ async function czLoadCit() {
         var r = await api('/api/cz/citizens?q=' + encodeURIComponent(CZ_ADM.q));
         var h = '<div class="card"><h2>👥 المواطنون</h2><div class="row" style="gap:8px;margin-top:8px"><input id="cz-cq" placeholder="ابحث بالاسم أو رقم الهوية" value="' + czEsc(CZ_ADM.q) + '"><button class="btn sm" onclick="czCitSearch()">بحث</button></div></div>';
         if (!r.list.length) h += '<div class="card center" style="color:var(--muted)">لا يوجد مواطنون</div>';
-        r.list.forEach(function (c, i) {
+        r.list.forEach(function (c) {
             var opts = '<option value="">— بدون وظيفة —</option>' + CZ_ADM.jobs.map(function (jb) { return '<option value="' + jb._id + '"' + (c.jobId === jb._id ? ' selected' : '') + '>' + czEsc(jb.name) + '</option>'; }).join('');
-            h += '<div class="cz-fine"><div class="cz-row"><b>' + czEsc(c.fullName) + '</b><span class="cz-tag ' + (c.status === 'approved' ? 'pd' : 'un') + '">' + (c.status === 'approved' ? 'فعّال' : 'موقوف') + '</span></div>' +
-                '<div style="font-size:13px;margin-top:6px">🪪 الهوية: <b style="color:#facc15">' + czEsc(c.civilId || '-') + '</b> <button class="btn sm gray" data-u="' + c.uid + '" onclick="czEditId(this.dataset.u)">تعديل</button></div>' +
-                '<div style="font-size:12px;color:var(--muted);margin-top:4px">' + czEsc(c.email) + ' • رخصة: ' + (c.licenseStatus === 'approved' ? 'معتمدة' : c.licenseStatus === 'revoked' ? 'مسحوبة' : c.licenseStatus === 'pending' ? 'قيد المراجعة' : 'لا يوجد') + '</div>' +
-                '<div style="margin-top:6px">' + (c.vehicles.map(function (v, k) { return '<span class="cz-veh">🚗 ' + czEsc(v.name) + ' <a style="cursor:pointer;color:#fca5a5" data-u="' + c.uid + '" data-n="' + czEsc(v.name) + '" onclick="czVehRemove(this.dataset.u,this.dataset.n)">✕</a></span>'; }).join('')) + '</div>' +
-                '<div class="row" style="gap:8px;margin-top:8px;flex-wrap:wrap"><select data-u="' + c.uid + '" onchange="czSetJob(this.dataset.u,this.value)" style="max-width:200px">' + opts + '</select>' +
-                (c.licenseStatus === 'approved' ? '<button class="btn sm danger" data-u="' + c.uid + '" onclick="czRevoke(this.dataset.u)">سحب الرخصة</button>' : '') +
-                (ME.isSeniorAdmin ? '<button class="btn sm ' + (c.status === 'approved' ? 'danger' : '') + '" data-u="' + c.uid + '" data-s="' + (c.status === 'approved' ? 'suspended' : 'approved') + '" onclick="czSetStatus(this.dataset.u,this.dataset.s)">' + (c.status === 'approved' ? 'إيقاف' : 'فك الإيقاف') + '</button>' : '') + '</div></div>';
+            var lic = c.licenseStatus === 'approved' ? 'معتمدة' : c.licenseStatus === 'revoked' ? 'مسحوبة' : c.licenseStatus === 'pending' ? 'قيد المراجعة' : 'لا يوجد';
+            var vehs = c.vehicles.length ? c.vehicles.map(function (v) { return '<span class="cz-veh">🚗 ' + czEsc(v.name) + ' <a style="cursor:pointer;color:#fca5a5" data-u="' + c.uid + '" data-n="' + czEsc(v.name) + '" onclick="czVehRemove(this.dataset.u,this.dataset.n)">✕</a></span>'; }).join('') : '<span style="color:var(--muted)">لا يوجد</span>';
+            h += '<div class="card acc-card">' +
+                '<div class="acc-title">' + czEsc(c.fullName) + ' <span class="acc-tag">' + (c.status === 'approved' ? '✅ فعّال' : '⛔ موقوف') + '</span></div>' +
+                accRow('رقم الهوية', c.civilId || '-') +
+                accRow('البريد', c.email || '-') +
+                accRow('الرخصة', lic) +
+                '<div class="acc-row"><span>المركبات</span><b style="word-break:normal">' + vehs + '</b></div>' +
+                '<div class="acc-row"><span>الوظيفة</span><select data-u="' + c.uid + '" onchange="czSetJob(this.dataset.u,this.value)" style="max-width:200px;margin:0">' + opts + '</select></div>' +
+                '<div class="row" style="gap:8px;margin-top:12px;flex-wrap:wrap">' +
+                    '<button class="btn sm" data-u="' + c.uid + '" onclick="czEditId(this.dataset.u)">✏️ تعديل الهوية</button>' +
+                    (c.licenseStatus === 'approved' ? '<button class="btn sm danger" data-u="' + c.uid + '" onclick="czRevoke(this.dataset.u)">🚫 سحب الرخصة</button>' : '') +
+                    (ME.isSeniorAdmin ? '<button class="btn sm ' + (c.status === 'approved' ? 'danger' : '') + '" data-u="' + c.uid + '" data-s="' + (c.status === 'approved' ? 'suspended' : 'approved') + '" onclick="czSetStatus(this.dataset.u,this.dataset.s)">' + (c.status === 'approved' ? '⛔ إيقاف' : '✅ فك الإيقاف') + '</button>' : '') +
+                (ME.isSeniorAdmin ? '<button class="btn sm danger" data-u="' + c.uid + '" onclick="czDeleteCit(this.dataset.u)">🗑️ حذف الحساب</button>' : '') +
+                '</div></div>';
         });
         box.innerHTML = h;
         var qi = document.getElementById('cz-cq'); if (qi) qi.onkeydown = function (e) { if (e.key === 'Enter') czCitSearch(); };
@@ -17417,8 +17479,8 @@ function renderSavedLogin(list) {
             '<a class="auth-link" style="display:block;margin-top:8px;font-size:12px;" data-i="' + i + '" onclick="removeSavedLogin(this.dataset.i)">إزالة من هذا الجهاز</a></div>';
     }).join('');
     authShell(
-        '<h1 class="auth-title">سيرفر وزارة الداخلية</h1>' +
-        '<div class="auth-sub">Ministry of Interior Server</div>' +
+        '<h1 class="auth-title">فلاش</h1>' +
+        '<div class="auth-sub">Flash</div>' +
         '<div id="auth-err" class="auth-err"></div>' +
         '<label class="auth-label">اختر الحساب اللي تبي تدخله :</label>' + cards +
         '<div class="auth-sep"></div>' +
@@ -17464,8 +17526,8 @@ function renderLogin(forceForm) {
         if (savedList.length) { renderSavedLogin(savedList); return; }
     }
     authShell(
-        '<h1 class="auth-title">سيرفر وزارة الداخلية</h1>' +
-        '<div class="auth-sub">Ministry of Interior Server</div>' +
+        '<h1 class="auth-title">فلاش</h1>' +
+        '<div class="auth-sub">Flash</div>' +
         '<div id="auth-err" class="auth-err"></div>' +
         '<label class="auth-label">البريد الإلكتروني :</label>' +
         '<input id="lg-email" class="auth-input" type="email" dir="ltr" placeholder="example@email.com" autocomplete="username">' +
@@ -17501,7 +17563,7 @@ async function doLogin() {
 }
 function renderRegister() {
     authShell(
-        '<h1 class="auth-title">سيرفر وزارة الداخلية</h1>' +
+        '<h1 class="auth-title">فلاش</h1>' +
         '<div class="auth-sub">تسجيل حساب جديد</div>' +
         '<div id="auth-err" class="auth-err"></div>' +
         '<div class="auth-grid">' +
@@ -17512,9 +17574,9 @@ function renderRegister() {
         '</div>' +
         '<div><label class="auth-label">كلمة المرور :</label><div class="pw-wrap"><input id="rg-pw" class="auth-input" type="password" placeholder="••••••••" dir="ltr" autocomplete="off"><button type="button" class="pw-eye" data-t="rg-pw" onclick="togglePwEye(this.dataset.t, this)">👁</button></div><span class="auth-req">* حقل إجباري</span></div>' +
         '<div class="auth-sep" style="margin:6px 0 20px;"></div>' +
-        '<label class="auth-check"><input type="checkbox" id="rg-avail"><span>هل أنت متفرغ للعمل في سيرفر وزارة الداخلية ؟</span></label>' +
+        '<label class="auth-check"><input type="checkbox" id="rg-avail"><span>هل أنت متفرغ للعمل في فلاش ؟</span></label>' +
         '<label class="auth-check"><input type="checkbox" id="rg-capable"><span>هل لديك القدرة علي المشاركة الصوتية والتصوير وتحمل ضغوط العمل ؟</span></label>' +
-        '<label class="auth-check"><input type="checkbox" id="rg-terms"><span>الموافقة علي القوانين والشروط وسياسة سيرفر وزارة الداخلية الواقعي</span></label>' +
+        '<label class="auth-check"><input type="checkbox" id="rg-terms"><span>الموافقة علي القوانين والشروط وسياسة فلاش</span></label>' +
         '<button class="auth-btn" onclick="doRegister()">إنشاء الحساب</button>' +
         '<div class="auth-sep" style="margin:22px 0 18px;"></div>' +
         '<a class="auth-link" onclick="renderLogin()">لديك حساب؟ سجل دخولك</a>'
@@ -17575,42 +17637,38 @@ async function doSetup() {
 }
 function renderDashboard() {
     if (typeof FLASH_AS !== 'undefined' && FLASH_AS) { FLASH_AS = null; refreshMe().then(function () { renderDashboard(); }); return; }
+    czInjectStyle();
     document.getElementById('app').innerHTML = \`
-        <div class="card row">
-            <div class="row" style="gap:14px;">
-                \${ME.avatar ? \`<img class="avatar" src="\${ME.avatar}">\` : ''}
-                <div><h2 style="margin-bottom:2px;">\${ME.registeredName}</h2><div style="color:var(--muted);font-size:13px;">\${ME.unit} • \${ME.rank}</div></div>
-            </div>
-            <div class="row" style="gap:8px;">
-                <button class="btn sm btn-checkout" onclick="flBankOpen()">🏦 بنك فلاش</button>
-                \${ME.isAdmin ? '<button class="btn gray sm" onclick="renderAdmin()">لوحة الإدارة</button>' : ''}
-                \${(ME.sectorInfo && ME.sectorInfo.sector !== 'cyber') ? \`<button class="btn gray sm" onclick="renderSectorPanel()">قيادة \${ME.sectorInfo.sectorLabel}</button>\` : ''}
-                <a class="btn gray sm" href="/auth/logout">خروج</a>
-            </div>
+        <div class="cz-wrap">
+        <div class="cz-hd">
+            <div><div class="cz-hd-name">\${ME.registeredName}</div><div class="cz-hd-sub">\${ME.unit} • \${ME.rank}</div></div>
+            <a class="btn gray sm" href="/auth/logout">🚪 خروج</a>
         </div>
         \${flAttCardHtml()}<div id="push-banner"></div><div id="court-soon">\${courtSoonHtml()}</div>
         \${ME.maintenance ? '<div class="card" style="border-color:var(--amber);color:#fbbf24;">⚠️ الموقع في وضع الصيانة حالياً</div>' : ''}
         \${ME.seniorTemp ? '<div class="card" style="border-color:var(--amber);color:#fbbf24;">🔑 هذا حساب كبير مسؤولين جديد خاص فيك. بريدك: <b dir="ltr">' + ME.accountEmail + '</b> — غيّر البريد وكلمة المرور من لوحة كبار المسؤولين ← الحسابات المقبولة ← تعديل، وبعدها يصير حسابك أنت. لو ما غيّرتها ودخلت مرة ثانية بالبيانات الافتراضية بينفتح لك حساب جديد غير هذا.</div>' : ''}
         \${cardBlock(ME, { id: 'home-card', hasProgress: true, nextRank: ME.nextRank, remaining: ME.pointsRemaining, remainId: 'home-remaining' })}
-        <div class="grid3" style="margin-top:16px;">
-            <div class="stat"><div class="num" id="home-points">\${ME.points}</div><div class="lbl">النقاط</div></div>
-            <div class="stat"><div class="num" id="mine-count">-</div><div class="lbl">مخالفاتي</div></div>
-            <div class="stat"><div class="num" id="home-rank" style="font-size:15px;">\${ME.isBlocked ? '🚫 موقوف' : '✅ فعّال'}</div><div class="lbl">الحالة</div></div>
+        <div class="cz-tile" style="margin-top:16px;">
+            <div><b id="home-points">\${ME.points}</b><small>النقاط</small></div>
+            <div><b id="mine-count">-</b><small>مخالفاتي</small></div>
+            <div><b id="home-rank" style="font-size:15px;">\${ME.isBlocked ? '🚫 موقوف' : '✅ فعّال'}</b><small>الحالة</small></div>
         </div>
-        <div class="card">
-            <div class="row">
-                <h3>مخالفاتي المسجلة</h3>
-                <div class="row" style="gap:8px;">
-                    <button class="btn sm" onclick="renderCard()">بطاقتي</button>
-                    \${/* ملاحظة: هنا التردد — تم حذف الزر فقط والكود باقي. لإرجاع الزر استبدل '' بـ flFreqBtnHtml() */ ''}
-                    \${!ME.violationsDisabled ? (ME.isAntiDrugs && !ME.isSeniorAdmin
-                        ? '<button class="btn sm" onclick="renderNewReport()">+ تسجيل تقرير جديد</button>'
-                        : '<button class="btn sm" onclick="renderNewViolation()">+ تسجيل مخالفة جديدة</button>') : ''}
-                    \${flAfterBtnsHtml()}
-                </div>
-            </div>
+        <div class="cz-actions">
+            <button class="btn" onclick="renderCard()">🪪 بطاقتي</button>
+            \${!ME.violationsDisabled ? (ME.isAntiDrugs && !ME.isSeniorAdmin
+                ? '<button class="btn" onclick="renderNewReport()">📝 تسجيل تقرير</button>'
+                : '<button class="btn" onclick="renderNewViolation()">🚨 تسجيل مخالفة</button>') : ''}
+            <button class="btn gray" onclick="flBankOpen()">🏦 بنك فلاش</button>
+            \${ME.isAdmin ? '<button class="btn gray" onclick="renderAdmin()">🛠️ لوحة الإدارة</button>' : ''}
+            \${(ME.sectorInfo && ME.sectorInfo.sector !== 'cyber') ? \`<button class="btn gray" onclick="renderSectorPanel()">🪖 قيادة \${ME.sectorInfo.sectorLabel}</button>\` : ''}
+            \${/* ملاحظة: هنا التردد — تم حذف الزر فقط والكود باقي. لإرجاع الزر استبدل '' بـ flFreqBtnHtml() */ ''}
+            \${flAfterBtnsHtml()}
+        </div>
+        <div class="cz-fine">
+            <div class="cz-row"><b>📋 مخالفاتي المسجلة</b></div>
             <div id="notes-box" style="margin:10px 0;"></div>
             <div id="mine-list">جارِ التحميل...</div>
+        </div>
         </div>
         \${renderFabs()}
     \`;
@@ -17905,37 +17963,44 @@ function renderAdmin(startTab) {
     if (typeof startTab !== 'string') startTab = null;
     if (!ME.isSeniorAdmin && (startTab === 'pending' || !startTab)) startTab = 'regs';
     const tabsHtml = ME.isSeniorAdmin ? \`
-        <div class="tabs">
+        <div class="tab-groups">
+        <div class="tab-group"><div class="tab-group-title">⚖️ المخالفات</div><div class="tabs">
             <div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div>
             <div class="tab" onclick="adminTab('reviewed', this)">✅ المخالفات المقبولة</div>
-            <div class="tab" onclick="adminTab('sectors', this)">قادة القطاعات</div>
+        </div></div>
+        <div class="tab-group"><div class="tab-group-title">👥 الأعضاء والحسابات</div><div class="tabs">
             <div class="tab" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div>
-            <div class="tab" id="tab-czlic" onclick="adminTab('czlic', this)">🪪 طلبات الرخص والمركبات</div>
-            <div class="tab" id="tab-czcit" onclick="adminTab('czcit', this)">👥 المواطنون</div>
-            <div class="tab" id="tab-czprice" onclick="adminTab('czprice', this)">💰 أسعار المخالفات</div>
-            <div class="tab" id="tab-czjobs" onclick="adminTab('czjobs', this)">💼 الوظائف</div>
-            <div class="tab" id="tab-cphoto" onclick="adminTab('cphoto', this)">🖼️ صور البطاقات</div>
-            <div class="tab" id="tab-cards" onclick="adminTab('cards', this)">🪪 تحكم البطاقات</div>
             <div class="tab" onclick="adminTab('accounts', this)">✅ الحسابات المقبولة</div>
             <div class="tab" onclick="adminTab('personnel', this)">ملفات العسكريين</div>
             <div class="tab" onclick="adminTab('sfile', this)">📇 عرض ملف عسكري</div>
-            <div class="tab" onclick="adminTab('vehicles', this)">المركبات</div>
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
+        </div></div>
+        <div class="tab-group"><div class="tab-group-title">🪖 القطاعات والعمليات</div><div class="tabs">
+            <div class="tab" onclick="adminTab('sectors', this)">قادة القطاعات</div>
+            <div class="tab" onclick="adminTab('att', this)">🖐️ لوحة البصمة</div>
             <div class="tab" onclick="adminTab('leave', this)">🌴 طلبات الإجازات</div>
             <div class="tab" id="tab-excuses" onclick="adminTab('excuses', this)">🩺 غياب بعذر</div>
-            <div class="tab" onclick="adminTab('att', this)">🖐️ لوحة البصمة</div>
-            \${/* ملاحظة: هنا سلك الضباط (إدارة السلك) — النظام موجود بالكود وتم حذف التاب فقط. لإرجاعه شغّل OFFICERS_CORPS_ENABLED */ ''}
-            \${OFFICERS_CORPS_ENABLED ? '<div class="tab" id="tab-officers" onclick="adminTab(\\'officers\\', this)">🎖️ إدارة سلك الضباط</div>' : ''}
             <div class="tab" id="tab-court" onclick="adminTab('court', this)">⚖️ المحكمة العسكرية</div>
             <div class="tab" id="tab-inv" onclick="adminTab('inv', this)">🔎 التحقيق العسكري</div>
+            \${/* ملاحظة: هنا سلك الضباط (إدارة السلك) — النظام موجود بالكود وتم حذف التاب فقط. لإرجاعه شغّل OFFICERS_CORPS_ENABLED */ ''}
+            \${OFFICERS_CORPS_ENABLED ? '<div class="tab" id="tab-officers" onclick="adminTab(\\'officers\\', this)">🎖️ إدارة سلك الضباط</div>' : ''}
+        </div></div>
+        <div class="tab-group"><div class="tab-group-title">🚗 المواطنون</div><div class="tabs">
+            <div class="tab" id="tab-czcit" onclick="adminTab('czcit', this)">👥 المواطنون</div>
+            <div class="tab" id="tab-czlic" onclick="adminTab('czlic', this)">🪪 طلبات الرخص والمركبات</div>
+            <div class="tab" onclick="adminTab('vehicles', this)">المركبات</div>
+            <div class="tab" id="tab-czprice" onclick="adminTab('czprice', this)">💰 أسعار المخالفات</div>
+            <div class="tab" id="tab-czjobs" onclick="adminTab('czjobs', this)">💼 الوظائف</div>
+        </div></div>
+        <div class="tab-group"><div class="tab-group-title">⚙️ النظام</div><div class="tabs">
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
             <div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div>
-            <div class="tab" onclick="adminTab('push', this)">📣 الإشعارات</div>
-            \${/* ملاحظة: هنا التردد — تم حذف التاب فقط والكود باقي. لإرجاعه حط مكان '' هذا: '<div class="tab" onclick="adminTab(\'freq\', this)">📻 الترددات</div>' */ ''}
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
-        </div>\` : (ME.isAdmin ? \`<div class="tabs"><div class="tab active" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div><div class="tab" id="tab-czlic" onclick="adminTab('czlic', this)">🪪 طلبات الرخص والمركبات</div><div class="tab" id="tab-czcit" onclick="adminTab('czcit', this)">👥 المواطنون</div><div class="tab" id="tab-cphoto" onclick="adminTab('cphoto', this)">🖼️ صور البطاقات</div><div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div></div>\` : '');
+            \${/* ملاحظة: هنا التردد — تم حذف التاب فقط والكود باقي. لإرجاعه حط مكان '' هذا: '<div class="tab" onclick="adminTab(\'freq\', this)">📻 الترددات</div>' */ ''}
+        </div></div>
+        </div>\` : (ME.isAdmin ? \`<div class="tabs"><div class="tab active" onclick="adminTab('regs', this)">📥 طلبات التسجيل</div><div class="tab" id="tab-czlic" onclick="adminTab('czlic', this)">🪪 طلبات الرخص والمركبات</div><div class="tab" id="tab-czcit" onclick="adminTab('czcit', this)">👥 المواطنون</div><div class="tab" id="tab-support" onclick="adminTab('support', this)">🎧 خدمة العملاء</div></div>\` : '');
     document.getElementById('app').innerHTML = \`
         <div class="card row"><h2>\${ME.isSeniorAdmin ? 'لوحة تحكم كبار المسؤولين' : 'لوحة الإدارة'}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
         \${tabsHtml}
@@ -20908,7 +20973,7 @@ function lxBarcode(num) {
 }
 // البطاقة العسكرية الفخمة (تصميم برمجي بدون صور خلفية)
 function mcFaceLux(f) {
-    var photo = f.avatar ? '<img class=\"lx-photo\" src=\"' + cardEsc(f.avatar) + '\" alt=\"\" onerror=\"this.remove()\">' : '<div class=\"lx-nophoto\">👤</div>';
+    var photo = '';
     var row = function (top, label, val, fs) { return '<div class=\"lx-f\" style=\"top:' + top + 'cqw;font-size:' + lxFs(val, fs) + ';\"><i>' + label + '</i><b>' + cardEsc(val) + '</b></div>'; };
     var okNum = /^[0-9]{8}$/.test(String(f.num));
     var bars = lxBarcode(f.num);
@@ -20920,13 +20985,12 @@ function mcFaceLux(f) {
         row(29.5, 'اليونت', f.unit, 3.1) +
         row(36.5, 'القطاع', f.sector, 3.1) +
         photo + bc +
-        '<div class=\"lx-numl\">رقم البطاقة</div><div class=\"lx-num\">' + cardEsc(f.num) + '</div>' +
+        '<div class=\"lx-warn\">⚠️ للمحاكاة واللعب فقط — ليست بطاقة حقيقية ولا تمت للواقع بصلة</div><div class=\"lx-numl\">رقم البطاقة</div><div class=\"lx-num\">' + cardEsc(f.num) + '</div>' +
         (f.admin ? '<div class=\"mc-adm-in\" style=\"right:6cqw;top:3cqw;\">إداري</div>' : '') +
         (f.revoked ? '<div class=\"mc-revoked\">ملغاة</div>' : '') +
     '</div>';
 }
 function mcFace(f) {
-    if (f.key !== 'senior' && f.key !== 'highCommand') return mcFaceLux(f);
     const L = MC_LAYOUT[f.key] || MC_LAYOUT['default'];
     const box = function (a) { return 'left:' + a[0] + '%;top:' + a[1] + '%;width:' + a[2] + '%;height:' + a[3] + '%;'; };
     // idx = رقم الصف (0 الاسم، 1 الرتبة، 2 القطاع، 3 الأخير). L.cols[idx] = [يسار، عرض] خاص بكل صف (لو ما انحطت يستخدم gx/gw)
@@ -20967,6 +21031,7 @@ function cardBlock(p, o) {
 }
 // ===== صورة البطاقة: العضو يرفع، والإدارة تراجع =====
 function cpSectionHtml() {
+    return ''; // صور البطاقات انشالت
     const st = ME.cardPhotoStatus;
     let h = '<div class="mc-row" id="cp-box"><div class="mc-row-top"><span>📷 صورة البطاقة</span></div>';
     if (st === 'pending') h += '<b style="color:#fbbf24;">⏳ صورتك قيد المراجعة من الإدارة</b><img src="/api/card-photo-pending/' + ME.discordId + '?t=' + Date.now() + '" alt="" style="width:72px;height:84px;object-fit:cover;border-radius:8px;margin-top:8px;display:block;">';
@@ -21259,6 +21324,7 @@ async function clearAllLogs() {
     } catch (e) { toast(e.message); }
 }
 let accView_ = 'approved';
+let accKind_ = 'all';
 let ACC_LIST = [];
 const ACC_SECTORS = [['', 'بدون قطاع'], ['mp', 'الشرطة العسكرية']];
 function accEsc(t) {
@@ -21325,18 +21391,48 @@ async function loadAccounts(view) {
         '<div class="card"><div class="acc-switch">' +
             '<button class="acc-sw' + (accView_ === 'approved' ? ' on' : '') + '" data-v="approved" onclick="loadAccounts(this.dataset.v)">✅ الحسابات المقبولة</button>' +
             '<button class="acc-sw' + (accView_ === 'rejected' ? ' on' : '') + '" data-v="rejected" onclick="loadAccounts(this.dataset.v)">❌ الحسابات المرفوضة</button>' +
-        '</div></div>' +
-        '<input id="acc-q" placeholder="🔍 بحث بالاسم أو البريد" oninput="renderAccList()">' +
+        '</div>' +
+        (accView_ === 'approved' ? '<div class="acc-kinds" id="acc-kinds"></div>' : '') +
+        '</div>' +
+        '<input id="acc-q" placeholder="🔍 بحث بالاسم أو البريد أو الهوية" oninput="renderAccList()">' +
         '<div id="acc-list"></div>';
     renderAccList();
 }
+function setAccKind(k) { accKind_ = k; renderAccList(); }
+function renderAccKinds() {
+    var el = document.getElementById('acc-kinds'); if (!el) return;
+    var m = ACC_LIST.filter(function (a) { return a.kind !== 'citizen'; }).length, c = ACC_LIST.length - m;
+    var b = function (k, t) { return '<button class="' + (accKind_ === k ? 'on' : '') + '" data-k="' + k + '" onclick="setAccKind(this.dataset.k)">' + t + '</button>'; };
+    el.innerHTML = b('all', '📋 الكل (' + ACC_LIST.length + ')') + b('mil', '🪖 عسكري (' + m + ')') + b('cit', '🧑 مواطن (' + c + ')');
+}
+function accCitCard(a) {
+    var lic = a.licenseStatus === 'approved' ? 'معتمدة' : a.licenseStatus === 'revoked' ? 'مسحوبة' : a.licenseStatus === 'pending' ? 'قيد المراجعة' : 'لا يوجد';
+    return '<div class="card acc-card acc-cit">' +
+        '<div class="acc-title">' + accEsc(a.fullName) + ' <span class="acc-tag kind">🧑 مواطن</span>' + (a.jobName ? ' <span class="acc-tag">💼 ' + accEsc(a.jobName) + '</span>' : '') + (a.suspended ? ' <span class="acc-tag">⛔ موقوف</span>' : '') + '</div>' +
+        accRow('البريد', a.email) + accPwRow(a.password) + accRow('العمر', a.age) + accRow('الجنسية', a.nationality) +
+        accRow('رقم الهوية', a.civilId || '-') + accRow('الرخصة', lic) + accRow('المركبات', a.vehiclesCount || 0) +
+        '<div class="row" style="gap:8px;margin-top:12px;flex-wrap:wrap;">' +
+            '<button class="btn danger sm" data-u="' + a.uid + '" onclick="czDeleteCit(this.dataset.u)">🗑️ حذف الحساب</button>' +
+            '<button class="btn gray sm" data-u="' + a.uid + '" data-s="' + (a.suspended ? 'approved' : 'suspended') + '" onclick="czSetStatus(this.dataset.u,this.dataset.s); setTimeout(loadAccounts, 600);">' + (a.suspended ? '✅ فك الإيقاف' : '⛔ إيقاف') + '</button>' +
+        '</div></div>';
+}
+async function czDeleteCit(uid) {
+    if (!(await confirmModal('متأكد تبي تحذف حساب هذا المواطن نهائياً؟ ما يرجع.'))) return;
+    try {
+        await api('/api/cz/citizens/' + encodeURIComponent(uid), { method: 'DELETE' });
+        toast('🗑️ انحذف حساب المواطن');
+        if (currentAdminTab === 'accounts') loadAccounts(); else czLoadCit();
+    } catch (e) { toast(e.message); }
+}
 function renderAccList() {
+    renderAccKinds();
     const q = ((document.getElementById('acc-q') || {}).value || '').trim().toLowerCase();
     const box = document.getElementById('acc-list');
     if (!box) return;
-    const list = ACC_LIST.filter(function (a) { if (OWNER_DISGUISE && a.isOwner && a.uid !== ME.discordId) return false; return !q || (a.fullName || '').toLowerCase().indexOf(q) >= 0 || (a.email || '').toLowerCase().indexOf(q) >= 0; });
+    const list = ACC_LIST.filter(function (a) { if (OWNER_DISGUISE && a.isOwner && a.uid !== ME.discordId) return false; if (accKind_ === 'mil' && a.kind === 'citizen') return false; if (accKind_ === 'cit' && a.kind !== 'citizen') return false; return !q || (a.fullName || '').toLowerCase().indexOf(q) >= 0 || (a.email || '').toLowerCase().indexOf(q) >= 0 || String(a.civilId || '').indexOf(q) >= 0; });
     if (!list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">' + (accView_ === 'approved' ? 'لا توجد حسابات مقبولة' : 'لا توجد حسابات مرفوضة') + '</div>'; return; }
     box.innerHTML = list.map(function (a) {
+        if (a.kind === 'citizen') return accCitCard(a);
         const isRej = accView_ === 'rejected';
         let btns = '';
         if (isRej) {
@@ -21351,8 +21447,8 @@ function renderAccList() {
                    (a.isSenior ? '' : '<button class="btn gray sm" data-uid="' + a.uid + '" data-act="rejected" onclick="accAction(this)">❌ رفض</button>') +
                    (canEdit ? '<button class="btn sm" data-uid="' + a.uid + '" onclick="openAccEdit(this.dataset.uid)">✏️ تعديل</button>' : '');
         }
-        return '<div class="card acc-card">' +
-            '<div class="acc-title">' + accEsc(a.fullName) + (a.isSenior ? ' <span class="acc-tag">كبير مسؤولين' + (a.uid === ME.discordId ? ' (حسابك)' : '') + '</span>' : '') + (a.isMP ? ' <span class="acc-tag">شرطة عسكرية</span>' : '') + '</div>' +
+        return '<div class="card acc-card acc-mil">' +
+            '<div class="acc-title">' + accEsc(a.fullName) + ' <span class="acc-tag kind">🪖 عسكري</span>' + (a.isSenior ? ' <span class="acc-tag">كبير مسؤولين' + (a.uid === ME.discordId ? ' (حسابك)' : '') + '</span>' : '') + (a.isMP ? ' <span class="acc-tag">شرطة عسكرية</span>' : '') + '</div>' +
             accRow('البريد', a.email) + accPwRow(a.password) + accRow('العمر', a.age) + accRow('الجنسية', a.nationality) +
             accRow('القطاع', accSectorLabel(a.sector)) +
             accRow('متفرغ للعمل؟', accYN(a.answers && a.answers.available)) +
@@ -22205,6 +22301,10 @@ async function checkBotStatus() {
         h += row(d.ready, 'اتصال البوت: ' + (d.ready ? 'متصل' + (d.tag ? ' (' + d.tag + ')' : '') : 'غير متصل'));
         if (d.error) h += '<div style="margin-top:8px;color:#fca5a5;direction:ltr;text-align:left;font-size:13px;">' + d.error + '</div>';
         h += row(d.guild, 'آيدي السيرفر (GUILD_ID): ' + (d.guild ? 'موجود' : 'غير موجود'));
+        (d.instances || []).forEach(function (i) {
+            h += row(i.ready, 'استضافة ' + i.host + (i.me ? ' (هذي اللي فاتح منها الموقع)' : ' (استضافة ثانية)') + ': ' + (i.ready ? 'البوت متصل' + (i.tag ? ' (' + i.tag + ')' : '') : (i.hasToken ? 'البوت غير متصل' : 'ما فيها BOT_TOKEN')) + ' — آخر نبضة قبل ' + i.ageSec + ' ثانية' + (i.error && !i.ready ? ' — ' + i.error : ''));
+        });
+        if (!(d.instances || []).length) h += '<div style="margin-top:8px;color:var(--muted);font-size:12px;">ما وصلت نبضات بعد (تتحدث كل 20 ثانية). إذا فيه استضافة ثانية لازم تشغّل نفس الملف ونفس MONGO_URI.</div>';
         d.channels.forEach(function (c) { h += row(c.ok, c.label + ': ' + c.note); });
         ownerModalOpen('🤖 فحص اتصال البوت', h);
     } catch (e) { toast(e.message); }
@@ -24330,6 +24430,7 @@ function flPushSend(sub) {
     }).catch(function () {});
 }
 async function flPushInit() {
+    if (!FL_PUSH_ENABLED) return;
     if (!flPushSupported() || !ME || ME.blocked) return;
     try {
         var reg = await navigator.serviceWorker.ready;
@@ -24373,6 +24474,7 @@ function flPushBanner() {
 /* ---------------- نافذة تفعيل الإشعارات (أول شي بعد الدخول) ---------------- */
 var NG = { busy: false, on: false, obs: null };
 async function ntGate() {
+    if (!FL_PUSH_ENABLED) return;
     if (!ME || ME.blocked || !flPushSupported()) { ntClear(); return false; }
     if (!FLX.push.ready) {
         await Promise.race([flPushInit(), new Promise(function (r) { setTimeout(r, 8000); })]);
@@ -24714,7 +24816,7 @@ async function flReceptionClose() {
 }
 
 /* ---------------- تردد القطاعات المشتركة ---------------- */
-function flAskNotif() { try { if (window.Notification && Notification.permission === 'default') Notification.requestPermission(); } catch (e) {} }
+function flAskNotif() { if (!FL_PUSH_ENABLED) return; try { if (window.Notification && Notification.permission === 'default') Notification.requestPermission(); } catch (e) {} }
 async function flFreqOpen() {
     if (!attOk()) return;
     flAskNotif();
