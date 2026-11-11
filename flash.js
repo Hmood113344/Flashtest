@@ -16332,7 +16332,7 @@ function czMilCard(p, o) {
     var off = !!(p.isBlocked || f.revoked);
     var av = f.avatar ? '<img src="' + czEsc(f.avatar) + '" alt="" onerror="this.remove()">' : '';
     var stripes = '<i></i><i></i><i></i>';
-    var bcMode = o.big ? 'plain' : (o.preview ? 'link' : 'zoom');
+    var bcMode = 'link';
     if (!o.preview && !o.big) window.CZ_MIL_P = p;
     return '<div id="' + (o.id || 'home-card') + '" class="cz-mil-wrap' + ((o.preview || o.big) ? '' : ' cz-mil-s') + '">' +
         '<div class="cz-mil"' + ((o.preview || o.big) ? '' : ' onclick="czMilZoom()"') + '>' +
