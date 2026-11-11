@@ -729,6 +729,7 @@ const SettingsSchema = new mongoose.Schema({
     adminList: { type: [String], default: [] },
     rankThresholds: { type: Map, of: Number, default: {} },
     sectorLeadership: { type: mongoose.Schema.Types.Mixed, default: {} },
+    roleIds: { type: mongoose.Schema.Types.Mixed, default: {} }, // آيديات رولات الديسكورد: الرتب / المواطن / الوظائف / القطاعات (يقرأها البوت)
     mpLeadership: {
         commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
         deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
@@ -5193,6 +5194,31 @@ app.post("/api/leave/:id/reject", ensureAuth, async (req, res) => {
     res.json({ ok: true, leave });
 });
 
+// آيديات رولات الديسكورد (الرتب العسكرية، المواطن، الوظائف، القطاعات) — يقرأها بوت لوحة الدخول
+app.get("/api/senior/role-ids", ensureSeniorAdmin, async (req, res) => {
+    const s = await getSettings();
+    const r = s.roleIds || {};
+    const jobs = await CzJob.find().sort({ createdAt: 1 }).lean();
+    res.json({
+        ranks: CONFIG.MILITARY_RANKS.map(name => ({ name, id: (r.ranks || {})[name] || "" })),
+        citizen: r.citizen || "",
+        jobs: jobs.map(j => ({ id: String(j._id), name: j.name, roleId: (r.jobs || {})[String(j._id)] || "" })),
+        sectors: Object.keys(CONFIG.SECTORS).map(k => ({ key: k, label: CONFIG.SECTORS[k], roleId: (r.sectors || {})[k] || "" })),
+    });
+});
+app.post("/api/senior/role-ids", ensureSeniorAdmin, async (req, res) => {
+    const b = req.body || {};
+    const clean = o => { const out = {}; for (const [k, v] of Object.entries(o || {})) { const id = String(v || "").trim(); if (!id) continue; if (!/^\d{15,25}$/.test(id)) return null; out[k] = id; } return out; };
+    const ranks = clean(b.ranks), jobs = clean(b.jobs), sectors = clean(b.sectors);
+    const citizen = String(b.citizen || "").trim();
+    if (!ranks || !jobs || !sectors || (citizen && !/^\d{15,25}$/.test(citizen))) return res.status(400).json({ error: "الآيدي لازم أرقام فقط (آيدي الرول من ديسكورد)" });
+    const s = await getSettings();
+    s.roleIds = { ranks, citizen, jobs, sectors };
+    s.markModified("roleIds");
+    await s.save();
+    await logEvent({ action: "تعديل آيديات الرولات", actorId: req.user.id, actorTag: req.user.username, details: "الرتب: " + Object.keys(ranks).length + " • وظائف: " + Object.keys(jobs).length + " • قطاعات: " + Object.keys(sectors).length });
+    res.json({ ok: true });
+});
 app.get("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     const out = settings.toObject();
@@ -22213,6 +22239,7 @@ async function loadSettings() {
             <button class="btn gray" style="margin-top:14px;" onclick="checkPhotosStatus()">📷 فحص صور المخالفات</button>
         </div>\`;
     if (OFFICERS_CORPS_ENABLED) box.insertAdjacentHTML('beforeend', officersLockCardHtml(!!settings.officersLocked));
+    flRoleIdsCard(box);
     if (ME && ME.isOwner) {
         let locked = false;
         try { locked = !!(await api('/api/owner/saved-login-lock')).locked; } catch (e) {}
@@ -22308,6 +22335,33 @@ async function checkBotStatus() {
         d.channels.forEach(function (c) { h += row(c.ok, c.label + ': ' + c.note); });
         ownerModalOpen('🤖 فحص اتصال البوت', h);
     } catch (e) { toast(e.message); }
+}
+async function flRoleIdsCard(box) {
+    try {
+        var d = await api('/api/senior/role-ids');
+        var row = function (kind, key, label, val) {
+            return '<div class="row" style="gap:8px;margin-top:8px;"><span style="min-width:130px;font-size:13px;">' + accEsc(label) + '</span>' +
+                '<input class="rid-in" data-k="' + kind + '" data-key="' + accEsc(key) + '" inputmode="numeric" placeholder="آيدي الرول" value="' + accEsc(val || '') + '" style="direction:ltr;margin:0;"></div>';
+        };
+        var title = function (t) { return '<div style="font-weight:800;color:var(--gold-soft);margin-top:14px;">' + t + '</div>'; };
+        var h = '<div class="card"><h3>🏷️ آيديات الرتب (رولات ديسكورد)</h3>' +
+            '<div style="color:var(--muted);font-size:12px;margin:6px 0;">البوت يقرأ هذي الآيديات: لما العضو يضغط لوحة الدخول يدخل فلاش على رتبته وقطاعه حسب رولاته بالسيرفر.</div>';
+        h += title('🪖 الرتب العسكرية (جندي ← فريق أول)');
+        d.ranks.forEach(function (r) { h += row('ranks', r.name, r.name, r.id); });
+        h += title('🧑 رتبة المواطن') + row('citizen', 'citizen', 'مواطن', d.citizen);
+        if (d.jobs.length) { h += title('💼 الوظائف'); d.jobs.forEach(function (j) { h += row('jobs', j.id, j.name, j.roleId); }); }
+        if (d.sectors.length) { h += title('🪖 القطاعات'); d.sectors.forEach(function (s) { h += row('sectors', s.key, s.label, s.roleId); }); }
+        h += '<button class="btn" style="margin-top:14px;" onclick="saveRoleIds()">💾 حفظ الآيديات</button></div>';
+        box.insertAdjacentHTML('beforeend', h);
+    } catch (e) {}
+}
+async function saveRoleIds() {
+    var body = { ranks: {}, citizen: '', jobs: {}, sectors: {} };
+    document.querySelectorAll('.rid-in').forEach(function (el) {
+        var k = el.dataset.k, key = el.dataset.key, v = el.value.trim();
+        if (k === 'citizen') body.citizen = v; else body[k][key] = v;
+    });
+    try { await api('/api/senior/role-ids', { method: 'POST', body: JSON.stringify(body) }); toast('✅ انحفظت الآيديات'); } catch (e) { toast(e.message); }
 }
 async function saveSettings() {
     const body = {
